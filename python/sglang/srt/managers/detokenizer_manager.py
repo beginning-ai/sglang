@@ -249,6 +249,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_strs.append(incremental_output)
 
         return BatchStrOutput(
+            output_token_logits=recv_obj.output_token_logits,
             rids=recv_obj.rids,
             http_worker_ipcs=recv_obj.http_worker_ipcs,
             finished_reasons=recv_obj.finished_reasons,

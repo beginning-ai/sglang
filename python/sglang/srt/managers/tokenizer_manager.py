@@ -1456,6 +1456,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             ):
                 meta_info["prefill_latency"] = recv_obj.prefill_latency[i]
 
+            meta_info["output_token_logits"] = recv_obj.output_token_logits
+
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(
                     meta_info,

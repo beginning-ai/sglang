@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+import torch
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
@@ -907,6 +908,8 @@ class BatchTokenIDOutput(
     output_token_ids_logprobs_idx: List[List]
     output_token_entropy_val: List[float]
 
+    output_token_logits: torch.Tensor
+
     # Hidden states
     output_hidden_states: List[List[float]]
 
@@ -985,6 +988,8 @@ class BatchStrOutput(
     output_token_ids_logprobs_val: List[List]
     output_token_ids_logprobs_idx: List[List]
     output_token_entropy_val: List[float]
+
+    output_token_logits: torch.Tensor
 
     # Hidden states
     output_hidden_states: List[List[float]]

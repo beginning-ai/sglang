@@ -621,6 +621,8 @@ class Req:
         self.output_topk_p = None
         self.output_topk_index = None
 
+        self.output_token_logits: List[torch.Tensor] = []
+
         # Embedding (return values)
         self.embedding = None
 

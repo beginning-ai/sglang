@@ -138,6 +138,8 @@ class SchedulerOutputProcessorMixin:
                             )
                         logprob_pt += num_input_logprobs
 
+                    req.output_token_logits.append(logits_output.next_token_raw_logits[0].cpu())
+
                     if (
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
@@ -399,6 +401,8 @@ class SchedulerOutputProcessorMixin:
                     req.output_token_ids_logprobs_idx.append(
                         logits_output.next_token_token_ids_logprobs_idx[i]
                     )
+
+            req.output_token_logits.append(logits_output.next_token_raw_logits[0].cpu().clone())
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(
@@ -766,6 +770,8 @@ class SchedulerOutputProcessorMixin:
         prefill_delays = []
         prefill_latencies = []
 
+        output_token_logits = torch.zeros(0)
+
         if return_logprob:
             input_token_logprobs_val = []
             input_token_logprobs_idx = []
@@ -832,6 +838,9 @@ class SchedulerOutputProcessorMixin:
                     )
 
             if should_output:
+                # Each token logits have shape (vocab_size,)
+                output_token_logits = torch.stack(req.output_token_logits)
+
                 send_token_offset = req.send_token_offset
                 send_output_token_logprobs_offset = (
                     req.send_output_token_logprobs_offset
@@ -979,6 +988,7 @@ class SchedulerOutputProcessorMixin:
 
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
+                    output_token_logits=output_token_logits,
                     spec_verify_ct=spec_verify_ct,
                     spec_accepted_tokens=spec_accepted_tokens,
                     queue_time=queue_times,
