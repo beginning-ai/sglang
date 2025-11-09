@@ -138,6 +138,9 @@ class SchedulerOutputProcessorMixin:
                             )
                         logprob_pt += num_input_logprobs
 
+                    assert logits_output.input_token_logits is not None
+                    req.input_token_logits = logits_output.input_token_logits[i]
+
                     if (
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
@@ -766,6 +769,8 @@ class SchedulerOutputProcessorMixin:
         prefill_delays = []
         prefill_latencies = []
 
+        input_token_logits_val = []
+
         if return_logprob:
             input_token_logprobs_val = []
             input_token_logprobs_idx = []
@@ -892,6 +897,8 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
 
+                input_token_logits_val.append(req.input_token_logits)
+
                 if return_logprob:
                     if (
                         req.return_logprob
@@ -996,6 +1003,7 @@ class SchedulerOutputProcessorMixin:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
+                    input_token_logits_val=input_token_logits_val,
                     input_token_logprobs_val=input_token_logprobs_val,
                     input_token_logprobs_idx=input_token_logprobs_idx,
                     output_token_logprobs_val=output_token_logprobs_val,

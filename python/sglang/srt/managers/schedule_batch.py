@@ -582,6 +582,9 @@ class Req:
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
 
+        # Input logits (return values)
+        self.input_token_logits: Optional[torch.Tensor] = None
+
         # Logprobs (return values)
         # True means the input logprob has been already sent to detokenizer.
         self.input_logprob_sent: bool = False

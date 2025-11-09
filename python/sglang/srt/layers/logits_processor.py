@@ -16,6 +16,7 @@
 import dataclasses
 import logging
 from typing import List, Optional, Tuple, Union
+import itertools
 
 import torch
 import triton
@@ -98,6 +99,9 @@ class LogitsProcessorOutput:
         None
     )
     input_token_ids_logprobs_idx: Optional[List] = None
+
+    # The logits of the input tokens. shape [#seq, #vocab_size]
+    input_token_logits: Optional[List[torch.Tensor]] = None
 
 
 @dataclasses.dataclass
@@ -564,6 +568,9 @@ class LogitsProcessor(nn.Module):
         if should_skip_chunking:
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            seq_start_indices = itertools.accumulate([0] + logits_metadata.extend_seq_lens_cpu[:-1])
+            input_token_logits = [logits[i:i+n] for i, n in zip(seq_start_indices, logits_metadata.extend_seq_lens_cpu)]
+                        
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -583,6 +590,7 @@ class LogitsProcessor(nn.Module):
                 lm_head,
                 logits_metadata,
             )
+            input_token_logits = None
 
         return LogitsProcessorOutput(
             next_token_logits=sampled_logits,
@@ -592,6 +600,7 @@ class LogitsProcessor(nn.Module):
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
             input_token_ids_logprobs_val=logprobs_result.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
+            input_token_logits=input_token_logits,
         )
 
     def _process_input_logprobs(self, input_logprobs, logits_metadata):
