@@ -569,7 +569,7 @@ class LogitsProcessor(nn.Module):
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             seq_start_indices = itertools.accumulate([0] + logits_metadata.extend_seq_lens_cpu[:-1])
-            input_token_logits = [logits[i:i+n] for i, n in zip(seq_start_indices, logits_metadata.extend_seq_lens_cpu)]
+            input_token_logits = [logits[i:i+n].cpu() for i, n in zip(seq_start_indices, logits_metadata.extend_seq_lens_cpu)]
                         
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
