@@ -138,8 +138,8 @@ class SchedulerOutputProcessorMixin:
                             )
                         logprob_pt += num_input_logprobs
 
-                    assert logits_output.input_token_logits is not None
-                    req.input_token_logits = logits_output.input_token_logits[i]
+                    if logits_output.input_token_logits is not None:
+                        req.input_token_logits = logits_output.input_token_logits[i]
 
                     if (
                         req.return_hidden_states
@@ -897,7 +897,8 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
 
-                input_token_logits_val.append(req.input_token_logits)
+                if req.input_token_logits is not None:
+                    input_token_logits_val.append(req.input_token_logits)
 
                 if return_logprob:
                     if (
