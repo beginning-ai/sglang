@@ -139,7 +139,10 @@ class SchedulerOutputProcessorMixin:
                         logprob_pt += num_input_logprobs
 
                     if logits_output.input_token_logits is not None:
-                        req.input_token_logits = logits_output.input_token_logits[i]
+                        if req.input_token_logits is None:
+                            req.input_token_logits = logits_output.input_token_logits[i].clone()
+                        else:
+                            req.input_token_logits[req.input_token_logits_offset:] = logits_output.input_token_logits[i]
 
                     if (
                         req.return_hidden_states
@@ -204,6 +207,15 @@ class SchedulerOutputProcessorMixin:
                                     last_prefill_chunk=False,
                                 )
                             logprob_pt += num_input_logprobs
+
+                    # Incrementally update input logits.
+                    if logits_output.input_token_logits is not None:
+                        if req.input_token_logits is None:
+                            assert req.vocab_size is not None
+                            req.input_token_logits = torch.zeros((len(req.origin_input_ids), req.vocab_size), dtype=logits_output.input_token_logits[i].dtype)
+                        extend_input_len = extend_input_len_per_req[i]
+                        req.input_token_logits[req.input_token_logits_offset:req.input_token_logits_offset + extend_input_len] = logits_output.input_token_logits[i]
+                        req.input_token_logits_offset += extend_input_len
 
                     trace_slice(
                         RequestStage.PREFILL_CHUNKED_FORWARD,

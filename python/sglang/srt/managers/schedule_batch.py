@@ -583,6 +583,7 @@ class Req:
         self.top_p_normalized_logprobs = False
 
         # Input logits (return values)
+        self.input_token_logits_offset: int = 0
         self.input_token_logits: Optional[torch.Tensor] = None
 
         # Logprobs (return values)
