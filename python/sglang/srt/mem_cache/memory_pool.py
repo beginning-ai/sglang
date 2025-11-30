@@ -40,7 +40,7 @@ KVCache actually holds the physical kv cache.
 import abc
 import logging
 from contextlib import contextmanager, nullcontext
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -1275,6 +1275,139 @@ class HybridLinearKVPool(KVCache):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
+
+
+class HybridMultiHeadKVPool(KVCache):
+    """KV cache with separate pools for sub-models with different num_kv_heads.
+
+    Used for models like Qwen3-Omni where thinker, talker, and code2wave
+    have different numbers of KV heads.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_dim: int,
+        sub_model_configs: List[dict],
+        device: str,
+        enable_memory_saver: bool = False,
+    ):
+        """
+        Args:
+            size: KV cache size (number of tokens)
+            page_size: Page size for KV cache
+            dtype: Data type for KV cache
+            head_dim: Dimension of each attention head
+            sub_model_configs: List of configs, each with:
+                - "layer_ids": list of layer IDs for this sub-model
+                - "head_num": number of KV heads for this sub-model
+            device: Device to store KV cache
+            enable_memory_saver: Enable memory saver mode
+        """
+        self.size = size
+        self.page_size = page_size
+        self.dtype = dtype
+        self.head_dim = head_dim
+        self.device = device
+        self.enable_memory_saver = enable_memory_saver
+        self.sub_model_configs = sub_model_configs
+
+        # Create a pool for each sub-model config
+        self.pools: List[MHATokenToKVPool] = []
+        self.layer_to_pool_mapping: Dict[int, Tuple[int, int]] = {}
+
+        for pool_idx, config in enumerate(sub_model_configs):
+            layer_ids = config["layer_ids"]
+            head_num = config["head_num"]
+
+            pool = MHATokenToKVPool(
+                size=size,
+                page_size=page_size,
+                dtype=dtype,
+                head_num=head_num,
+                head_dim=head_dim,
+                layer_num=len(layer_ids),
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+            )
+            self.pools.append(pool)
+
+            # Map global layer_id -> (pool_idx, local_layer_id)
+            for local_idx, global_layer_id in enumerate(layer_ids):
+                self.layer_to_pool_mapping[global_layer_id] = (pool_idx, local_idx)
+
+        # Calculate total memory usage
+        total_k_size = sum(p.get_kv_size_bytes()[0] for p in self.pools)
+        total_v_size = sum(p.get_kv_size_bytes()[1] for p in self.pools)
+        self.mem_usage = (total_k_size + total_v_size) / GB
+
+    def _get_pool_and_local_id(self, layer_id: int) -> Tuple[MHATokenToKVPool, int]:
+        """Get the pool and local layer ID for a given global layer ID."""
+        if layer_id not in self.layer_to_pool_mapping:
+            raise ValueError(
+                f"layer_id {layer_id} not found in layer_to_pool_mapping. "
+                f"Available layer IDs: {list(self.layer_to_pool_mapping.keys())}"
+            )
+        pool_idx, local_layer_id = self.layer_to_pool_mapping[layer_id]
+        return self.pools[pool_idx], local_layer_id
+
+    def get_kv_size_bytes(self):
+        total_k = sum(p.get_kv_size_bytes()[0] for p in self.pools)
+        total_v = sum(p.get_kv_size_bytes()[1] for p in self.pools)
+        return total_k, total_v
+
+    def get_contiguous_buf_infos(self):
+        # Combine from all pools
+        all_data_ptrs = []
+        all_data_lens = []
+        all_item_lens = []
+        for pool in self.pools:
+            ptrs, lens, items = pool.get_contiguous_buf_infos()
+            all_data_ptrs.extend(ptrs)
+            all_data_lens.extend(lens)
+            all_item_lens.extend(items)
+        return all_data_ptrs, all_data_lens, all_item_lens
+
+    def maybe_get_custom_mem_pool(self):
+        # Return from first pool (they should all share same setting)
+        return self.pools[0].maybe_get_custom_mem_pool() if self.pools else None
+
+    def get_key_buffer(self, layer_id: int):
+        pool, local_id = self._get_pool_and_local_id(layer_id)
+        return pool.get_key_buffer(local_id)
+
+    def get_value_buffer(self, layer_id: int):
+        pool, local_id = self._get_pool_and_local_id(layer_id)
+        return pool.get_value_buffer(local_id)
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def set_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+    ):
+        pool, local_id = self._get_pool_and_local_id(layer.layer_id)
+        pool.set_kv_buffer(
+            layer,
+            loc,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            layer_id_override=local_id,
+        )
+
+    def get_v_head_dim(self):
+        # Return from first pool (head_dim should be same across all)
+        return self.pools[0].get_value_buffer(0).shape[-1] if self.pools else self.head_dim
 
 
 class MLATokenToKVPool(KVCache):

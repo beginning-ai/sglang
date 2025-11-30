@@ -485,6 +485,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
 
+    # Free Qwen3-Omni talker KV cache if present
+    if getattr(req, "talker_kv_cache_locs", None) is not None:
+        tree_cache.token_to_kv_pool_allocator.free(req.talker_kv_cache_locs)
+        req.talker_kv_cache_locs = None
+
     if start_p >= end_p:
         return
 

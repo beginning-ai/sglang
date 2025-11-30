@@ -38,13 +38,216 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 
+def wav_to_pcm16(wav: torch.Tensor) -> bytes:
+    """Convert float waveform tensor to PCM16 bytes.
+
+    Args:
+        wav: Float tensor in range [-1, 1], shape [batch, 1, samples] or [1, samples]
+
+    Returns:
+        PCM16 bytes (int16, little-endian)
+    """
+    # Squeeze to 1D
+    wav = wav.squeeze()
+    # Clamp and convert to int16
+    wav = (wav.clamp(-1, 1) * 32767).to(torch.int16)
+    return wav.cpu().numpy().tobytes()
+
+
+def maybe_decode_code2wav_chunk(
+    req: Req,
+    code2wav,
+    chunk_size: int = 10,
+    left_context_size: int = 25,
+) -> None:
+    """Decode new codec frames to PCM16 if enough frames have accumulated.
+
+    This should be called from the model forward path where code2wav is available.
+
+    Args:
+        req: Request object with talker_output_codes and streaming state
+        code2wav: Qwen3OmniMoeCode2Wav model instance
+        chunk_size: Number of new frames to accumulate before decoding (K)
+        left_context_size: Number of frames of left context for overlap
+    """
+    if not req.talker_output_codes:
+        return
+
+    current_frame = len(req.talker_output_codes)
+    new_frames = current_frame - req.talker_last_decoded_frame
+
+    # Check if we have enough new frames to decode a chunk
+    if new_frames < chunk_size:
+        return
+
+    # Check chunk cap to avoid unbounded memory
+    if len(req.talker_pcm16_chunks) >= req.talker_pcm16_chunk_cap:
+        return
+
+    # Build codes tensor: [1, num_quantizers, frames]
+    # talker_output_codes is List[List[int]] where each inner list has 16 codes
+    codes_list = req.talker_output_codes
+    num_quantizers = len(codes_list[0]) if codes_list else 16
+
+    # Determine context window
+    context_start = max(0, req.talker_last_decoded_frame - left_context_size)
+    context_size = req.talker_last_decoded_frame - context_start
+
+    # Build tensor for [context + new frames]
+    codes_window = codes_list[context_start:current_frame]
+    codes_tensor = torch.tensor(codes_window, dtype=torch.long, device=next(code2wav.parameters()).device)
+    codes_tensor = codes_tensor.transpose(0, 1).unsqueeze(0)  # [1, num_quantizers, T]
+
+    # Run code2wav
+    with torch.no_grad():
+        wav_chunk = code2wav(codes_tensor)
+
+    # Crop away the context samples
+    total_upsample = code2wav.total_upsample
+    pcm_start = context_size * total_upsample
+    wav_new = wav_chunk[..., pcm_start:]
+
+    # Convert to PCM16 bytes and store
+    pcm16_bytes = wav_to_pcm16(wav_new)
+    req.talker_pcm16_chunks.append(pcm16_bytes)
+
+    # Update last decoded frame
+    req.talker_last_decoded_frame = current_frame
+
+
+def save_pcm16_to_file(req: Req, code2wav=None) -> None:
+    """Save all codec codes to a WAV file when request finishes.
+
+    Decodes all accumulated codec codes using code2wav and writes to /tmp/<rid>.wav.
+    """
+    import wave
+
+    # Check if we have codec codes to decode
+    if not hasattr(req, "talker_output_codes") or not req.talker_output_codes:
+        return
+
+    # Get code2wav model - must be provided by caller
+    if code2wav is None:
+        return
+
+    # Build codes tensor from all accumulated codes: [1, num_quantizers, frames]
+    codes_list = req.talker_output_codes
+    num_frames = len(codes_list)
+
+    codes_tensor = torch.tensor(codes_list, dtype=torch.long, device=next(code2wav.parameters()).device)
+    codes_tensor = codes_tensor.transpose(0, 1).unsqueeze(0)  # [1, num_quantizers, T]
+
+    # Run code2wav
+    with torch.no_grad():
+        wav_output = code2wav(codes_tensor)
+
+    # TODO: Investigate root cause of ~10ms static at end of audio.
+    # Workaround: trim last 20ms (480 samples at 24kHz) from waveform.
+    trim_samples = 480
+    if wav_output.shape[-1] > trim_samples:
+        wav_output = wav_output[..., :-trim_samples]
+
+    # Convert to PCM16
+    pcm16_bytes = wav_to_pcm16(wav_output)
+
+    # Write WAV file
+    output_path = f"/tmp/{req.rid}.wav"
+    with wave.open(output_path, "wb") as wav_file:
+        wav_file.setnchannels(1)  # Mono
+        wav_file.setsampwidth(2)  # 16-bit = 2 bytes
+        wav_file.setframerate(24000)  # Qwen3-Omni uses 24kHz
+        wav_file.writeframes(pcm16_bytes)
+
+    print(f"[Code2Wav] Saved audio to {output_path} ({len(pcm16_bytes)} bytes, {num_frames} frames)")
+
+
+def _update_qwen3_omni_state(
+    req: Req,
+    logits_output,
+    req_idx: int,
+    thinker_token_id: int = None,
+    code2wav=None,
+    chunk_size: int = 10,
+    left_context_size: int = 25,
+) -> None:
+    """Update Qwen3-Omni talker state in Req after model forward.
+
+    With talker-before-code-predictor design:
+    - Model returns complete codec_frame (16 codes) instead of logits
+    - No more sampling in scheduler, no more past_talker_hidden
+    - Store prev_residual_codes for next decode step input
+
+    With 1-step delay design:
+    - At prefill: talker doesn't run, set talker_needs_prefill=True
+    - At first decode: talker prefill runs, returns first complete frame
+    - At subsequent decodes: talker uses prev_codec + prev_residual_codes as input
+    """
+    # Check if this is a ThinkerTalkerOutput
+    if not hasattr(logits_output, "talker_needs_prefill"):
+        return
+
+    # Handle talker_needs_prefill flag from model output
+    if hasattr(logits_output, "talker_needs_prefill") and logits_output.talker_needs_prefill:
+        req.talker_needs_prefill = True
+
+    # Store thinker token for talker look-ahead (shift by 1 step)
+    # Current token becomes prev_sampled for next step
+    if thinker_token_id is not None:
+        req.prev_sampled_thinker_token = thinker_token_id
+
+    # Handle complete codec_frame from model (16 codes: first codec + 15 residuals)
+    if logits_output.codec_frame is not None:
+        frame = logits_output.codec_frame
+        codec_token = frame[0]  # First codec token
+        residual_codes = frame[1:]  # 15 residual codes
+
+        # Store for next decode step input
+        req.talker_codec_ids.append(codec_token)
+        req.prev_residual_codes = residual_codes
+
+        # Store complete frame for Code2Wav
+        req.talker_output_codes.append(frame)
+
+    # Store tts_pad_embed (only set during prefill, for use when thinker finishes)
+    if logits_output.tts_pad_embed is not None:
+        if logits_output.tts_pad_embed.dim() == 2:
+            req.tts_pad_embed = logits_output.tts_pad_embed[req_idx].detach()
+        else:
+            req.tts_pad_embed = logits_output.tts_pad_embed.detach()
+
+    # Store talker KV cache location for cleanup at request end (set during talker prefill)
+    if logits_output.talker_out_cache_loc is not None:
+        req.talker_kv_cache_locs = logits_output.talker_out_cache_loc
+        req.talker_prefill_len = len(logits_output.talker_out_cache_loc)
+        # Clear the prefill flag after talker prefill runs
+        req.talker_needs_prefill = False
+
+    # Update talker KV cache locations during decode (includes newly allocated token)
+    if hasattr(logits_output, "updated_talker_kv_locs") and logits_output.updated_talker_kv_locs is not None:
+        req.talker_kv_cache_locs = logits_output.updated_talker_kv_locs
+
+    # Increment talker step when talker produces a frame (not during prefill)
+    if logits_output.codec_frame is not None and logits_output.talker_out_cache_loc is None:
+        req.talker_step += 1
+
+    # Trigger Code2Wav decode if model is available
+    if code2wav is not None:
+        maybe_decode_code2wav_chunk(req, code2wav, chunk_size, left_context_size)
+
+
 class SchedulerOutputProcessorMixin:
     """
     This class implements the output processing logic for Scheduler.
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
-    def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
+    def _get_code2wav_model(self: "Scheduler"):
+        """Get the code2wav model if available (for Qwen3-Omni)."""
+        if getattr(self.model_config.hf_config, "model_type", None) != "qwen3_omni_moe":
+            return None
+        return self.tp_worker.model_runner.model.code2wav
+
+    def process_batch_result_prebuilt(self: "Scheduler", batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
             req.check_finished()
@@ -122,6 +325,9 @@ class SchedulerOutputProcessorMixin:
             # Check finish conditions
             logprob_pt = 0
 
+            # Get code2wav model for Qwen3-Omni
+            code2wav = self._get_code2wav_model()
+
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
@@ -132,13 +338,21 @@ class SchedulerOutputProcessorMixin:
                         req.time_stats.prefill_finished_ts = time.time()
 
                     # req output_ids are set here
-                    req.output_ids.append(next_token_id)
+                    # Skip dummy tokens when thinker is done (Qwen3-Omni talker-only mode)
+                    if not req.thinker_done:
+                        req.output_ids.append(next_token_id)
+
+                    # Qwen3-Omni: Store talker state for next decode step
+                    _update_qwen3_omni_state(req, logits_output, i, thinker_token_id=next_token_id, code2wav=code2wav)
+
                     req.check_finished()
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
+                        # Qwen3-Omni: Save PCM16 audio to file
+                        save_pcm16_to_file(req, code2wav=code2wav)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
@@ -387,6 +601,9 @@ class SchedulerOutputProcessorMixin:
         # if finished, also clean up committed kv cache and over-allocated kv cache here
 
         # Check finish condition
+        # Get code2wav model for Qwen3-Omni
+        code2wav = self._get_code2wav_model()
+
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
 
@@ -397,15 +614,20 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             new_accepted_len = 1
-            if batch.spec_algorithm.is_none():
-                req.output_ids.append(next_token_id)
-            elif batch.is_spec_v2:
-                # Only spec v2's output_ids are updated here.
-                req.output_ids.extend(next_token_id)
-                new_accepted_len = len(next_token_id)
+            # Skip dummy tokens when thinker is done (Qwen3-Omni talker-only mode)
+            if not req.thinker_done:
+                if batch.spec_algorithm.is_none():
+                    req.output_ids.append(next_token_id)
+                elif batch.is_spec_v2:
+                    # Only spec v2's output_ids are updated here.
+                    req.output_ids.extend(next_token_id)
+                    new_accepted_len = len(next_token_id)
 
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
+
+            # Qwen3-Omni: Store talker state for next decode step
+            _update_qwen3_omni_state(req, logits_output, i, thinker_token_id=next_token_id, code2wav=code2wav)
 
             req.check_finished(new_accepted_len)
 
@@ -420,6 +642,8 @@ class SchedulerOutputProcessorMixin:
                     release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.completion_time = time.perf_counter()
+                # Qwen3-Omni: Save PCM16 audio to file
+                save_pcm16_to_file(req, code2wav=code2wav)
 
             self.maybe_collect_customized_info(i, req, logits_output)
 

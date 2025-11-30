@@ -514,6 +514,7 @@ class Req:
         extra_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        codec_eos_token_id: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -758,6 +759,23 @@ class Req:
         self.dllm_ids = []
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
+
+        # For Qwen3-Omni audio generation (thinker + talker)
+        self.thinker_done: bool = False  # Set when thinker emits EOS
+        self.talker_step: int = 0  # Current talker decode step
+        self.talker_needs_prefill: bool = False  # Delayed talker prefill (1-step delay)
+        self.prev_sampled_thinker_token: Optional[int] = None  # For talker look-ahead
+        self.tts_pad_embed: Optional[torch.Tensor] = None  # Cached from prefill
+        self.prev_residual_codes: Optional[List[int]] = None  # 15 residual codes from previous step
+        self.talker_codec_ids: List[int] = []  # Accumulated first codec tokens
+        self.talker_output_codes: List[List[int]] = []  # All 16 codes per step
+        self.codec_eos_token_id: Optional[int] = codec_eos_token_id  # From config
+        self.talker_kv_cache_locs: Optional[torch.Tensor] = None  # KV cache alloc for cleanup
+        self.talker_prefill_len: int = 0  # Length of talker prefill (for decode positions)
+        # Code2Wav streaming state
+        self.talker_pcm16_chunks: List[bytes] = []  # PCM16 audio chunks
+        self.talker_last_decoded_frame: int = 0  # Last codec frame decoded to PCM
+        self.talker_pcm16_chunk_cap: int = 1000  # Max chunks to buffer
 
     @property
     def seqlen(self) -> int:
@@ -1026,6 +1044,61 @@ class Req:
 
         return False
 
+    def _check_qwen3_omni_finish(self, new_accepted_tokens: List[int]) -> bool:
+        """Two-phase termination for Qwen3-Omni audio generation.
+
+        Phase 1: Thinker generates text until EOS -> set thinker_done, don't terminate
+        Phase 2: Talker continues generating codec tokens until codec EOS -> terminate
+
+        Returns True if this is a Qwen3-Omni request and termination was handled.
+        """
+        # Check if this is a Qwen3-Omni request (codec_eos_token_id is only set for Qwen3-Omni)
+        if self.codec_eos_token_id is None:
+            return False
+
+        codec_eos = self.codec_eos_token_id
+
+        if self.thinker_done:
+            # Phase 2: Talker is running
+
+            # Check talker max_new_tokens limit from custom_params
+            custom = self.sampling_params.custom_params
+            talker_limit = custom.get("talker_max_new_tokens") if custom else None
+            if talker_limit is not None and self.talker_step >= talker_limit:
+                self.finished_reason = FINISH_LENGTH(length=talker_limit)
+                self.finished_len = len(self.output_ids)
+                return True
+
+            # Check for codec EOS
+            if self.talker_codec_ids:
+                last_codec = self.talker_codec_ids[-1]
+                if last_codec == codec_eos:
+                    self.finished_reason = FINISH_MATCHED_TOKEN(matched=codec_eos)
+                    self.finished_len = len(self.output_ids)
+                    return True
+            # Talker still running, don't terminate
+            return True
+        else:
+            # Phase 1: Check if thinker hit EOS
+            for token_id in new_accepted_tokens:
+                matched_eos = False
+                if self.eos_token_ids:
+                    matched_eos |= token_id in self.eos_token_ids
+                if self.sampling_params.stop_token_ids is not None:
+                    matched_eos |= token_id in self.sampling_params.stop_token_ids
+                if self.tokenizer is not None:
+                    matched_eos |= token_id == self.tokenizer.eos_token_id
+                    if self.tokenizer.additional_stop_token_ids:
+                        matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
+
+                if matched_eos:
+                    # Thinker hit EOS - set flag but don't terminate yet
+                    self.thinker_done = True
+                    # Return True to prevent normal EOS handling
+                    return True
+
+        return False
+
     def check_finished(self, new_accepted_len: int = 1):
         if self.finished():
             return
@@ -1033,6 +1106,13 @@ class Req:
         if self.to_finish:
             self.finished_reason = self.to_finish
             self.to_finish = None
+            return
+
+        new_accepted_tokens = self.output_ids[-new_accepted_len:]
+
+        # Qwen3-Omni two-phase termination - must be before max_new_tokens
+        # so talker can continue after thinker hits the limit
+        if self._check_qwen3_omni_finish(new_accepted_tokens):
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
@@ -1046,8 +1126,6 @@ class Req:
             if self.grammar.is_terminated():
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
                 return
-
-        new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
         if self._check_token_based_finish(new_accepted_tokens):
             return
@@ -1081,6 +1159,7 @@ class Req:
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
+        self.talker_kv_cache_locs = None
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0

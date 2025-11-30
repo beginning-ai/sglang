@@ -297,6 +297,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
+        should_allreduce_fusion: bool = False,  # Unused, for Qwen3MoeDecoderLayer compat
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -552,9 +553,11 @@ class Qwen2MoeModel(nn.Module):
         prefix: str = "",
         decoder_layer_type: type[nn.Module] = Qwen2MoeDecoderLayer,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        layer_id_offset: int = 0,
     ) -> None:
         super().__init__()
         self.config = config
+        self.layer_id_offset = layer_id_offset
 
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -575,7 +578,7 @@ class Qwen2MoeModel(nn.Module):
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
-                layer_id=idx,
+                layer_id=idx + layer_id_offset,
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,

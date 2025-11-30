@@ -874,6 +874,23 @@ class CudaGraphRunner:
                     else None
                 ),
             )
+        elif hasattr(output, "thinker_logits"):
+            # Handle ThinkerTalkerOutput (Qwen3-Omni) - slice the inner LogitsProcessorOutput
+            sliced_thinker_logits = LogitsProcessorOutput(
+                next_token_logits=output.thinker_logits.next_token_logits[: self.raw_num_token],
+                hidden_states=(
+                    output.thinker_logits.hidden_states[: self.raw_num_token]
+                    if output.thinker_logits.hidden_states is not None
+                    else None
+                ),
+            )
+            # Create new output with sliced logits, preserving other fields
+            output_cls = type(output)
+            return output_cls(
+                thinker_logits=sliced_thinker_logits,
+                codec_frame=output.codec_frame,
+                tts_pad_embed=output.tts_pad_embed,
+            )
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})

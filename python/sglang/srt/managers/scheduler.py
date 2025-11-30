@@ -1477,6 +1477,13 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            # Extract Qwen3-Omni codec_eos_token_id from config if available
+            codec_eos_token_id = getattr(
+                getattr(self.model_config.hf_config, "talker_config", None),
+                "codec_eos_token_id",
+                None,
+            )
+
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -1505,6 +1512,7 @@ class Scheduler(
                 ),
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
+                codec_eos_token_id=codec_eos_token_id,
             )
             req.tokenizer = self.tokenizer
 

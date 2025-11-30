@@ -469,6 +469,12 @@ class ModelConfig:
         self.hidden_size = self.hf_text_config.hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
+        # For Qwen3 Omni, include all components (thinker + talker + code_predictor)
+        if getattr(self.hf_config, "model_type", None) == "qwen3_omni_moe":
+            thinker_layers = self.hf_config.thinker_config.text_config.num_hidden_layers
+            talker_layers = self.hf_config.talker_config.text_config.num_hidden_layers
+            code_pred_layers = self.hf_config.talker_config.code_predictor_config.num_hidden_layers
+            self.num_attention_layers = thinker_layers + talker_layers + code_pred_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
             self.num_attention_layers = self.num_hidden_layers * 2
         self.num_nextn_predict_layers = getattr(
@@ -564,6 +570,64 @@ class ModelConfig:
         # For MiMoV2FlashForCausalLM models
         total_num_kv_heads = self.hf_text_config.swa_num_key_value_heads
         return max(1, total_num_kv_heads // tensor_parallel_size)
+
+    def get_sub_model_kv_configs(self, tensor_parallel_size) -> list[dict] | None:
+        """Returns KV cache configs for models with heterogeneous sub-models.
+
+        For models like Qwen3-Omni where thinker, talker, and code2wave have
+        different numbers of KV heads, this returns a list of configs for each
+        sub-model to use with HybridMultiHeadKVPool.
+
+        Returns:
+            None if the model has homogeneous KV heads across all layers.
+            Otherwise, a list of dicts, each with:
+                - "layer_ids": list of layer IDs for this sub-model
+                - "head_num": number of KV heads for this sub-model
+        """
+        if getattr(self.hf_config, "model_type", None) == "qwen3_omni_moe":
+            configs = []
+            layer_offset = 0
+
+            # Thinker
+            thinker_text_config = self.hf_config.thinker_config.text_config
+            thinker_num_layers = thinker_text_config.num_hidden_layers
+            thinker_kv_heads = thinker_text_config.num_key_value_heads
+            configs.append(
+                {
+                    "layer_ids": list(range(layer_offset, layer_offset + thinker_num_layers)),
+                    "head_num": max(1, thinker_kv_heads // tensor_parallel_size),
+                }
+            )
+            layer_offset += thinker_num_layers
+
+            # Talker
+            talker_text_config = self.hf_config.talker_config.text_config
+            talker_num_layers = talker_text_config.num_hidden_layers
+            talker_kv_heads = talker_text_config.num_key_value_heads
+            configs.append(
+                {
+                    "layer_ids": list(range(layer_offset, layer_offset + talker_num_layers)),
+                    "head_num": max(1, talker_kv_heads // tensor_parallel_size),
+                }
+            )
+            layer_offset += talker_num_layers
+
+            code_pred_config = self.hf_config.talker_config.code_predictor_config
+            code_pred_num_layers = code_pred_config.num_hidden_layers
+            code_pred_kv_heads = code_pred_config.num_key_value_heads
+            configs.append(
+                {
+                    "layer_ids": list(
+                        range(layer_offset, layer_offset + code_pred_num_layers)
+                    ),
+                    "head_num": max(1, code_pred_kv_heads // tensor_parallel_size),
+                }
+            )
+
+            return configs
+
+        # Default: homogeneous KV heads
+        return None
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):

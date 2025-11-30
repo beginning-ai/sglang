@@ -348,6 +348,7 @@ class ForwardBatch:
     # Attention backend
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool: KVCache = None
+    token_to_kv_pool_allocator: "BaseTokenToKVPoolAllocator" = None
     attn_backend: AttentionBackend = None
 
     # For DP attention
@@ -435,6 +436,7 @@ class ForwardBatch:
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
+            token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
             attn_backend=model_runner.attn_backend,
             spec_algorithm=batch.spec_algorithm,
             spec_info=batch.spec_info,
@@ -545,6 +547,29 @@ class ForwardBatch:
         if model_runner.server_args.enable_lora:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
+        # Qwen3-Omni: Populate model_specific_states from Req fields for decode
+        if (
+            batch.reqs is not None
+            and len(batch.reqs) > 0
+            and hasattr(batch.reqs[0], "prev_residual_codes")
+        ):
+            ret._init_qwen3_omni_states(batch, model_runner.device)
+
+        # Qwen3-Omni: Store full input_ids for prefill (needed for talker with prefix caching)
+        if (
+            batch.reqs is not None
+            and len(batch.reqs) > 0
+            and hasattr(batch.reqs[0], "origin_input_ids")
+            and batch.forward_mode.is_extend()
+        ):
+            if ret.model_specific_states is None:
+                ret.model_specific_states = {}
+            # Store origin_input_ids as tensor for each request
+            ret.model_specific_states["origin_input_ids"] = [
+                torch.tensor(req.origin_input_ids, device=model_runner.device, dtype=torch.long)
+                for req in batch.reqs
+            ]
+
         return ret
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
@@ -617,6 +642,120 @@ class ForwardBatch:
             or self.contains_video_inputs()
             or self.contains_image_inputs()
         )
+
+    def _init_qwen3_omni_states(
+        self, batch: ModelWorkerBatch, device: torch.device
+    ) -> None:
+        """Initialize model_specific_states for Qwen3-Omni talker decode.
+
+        With talker-before-code-predictor design:
+        - prev_codec_id: the codec token from previous step (for building input)
+        - prev_residual_codes: the 15 residual codes from previous step (for building input)
+
+        With 1-step delay design:
+        - prev_sampled_thinker_token: the token sampled at previous thinker step (for look-ahead)
+        - talker_needs_prefill: True when talker prefill is pending (runs at first decode)
+
+        Collects per-request talker state from Req objects and packs them
+        into tensors for the model forward pass.
+        """
+        reqs = batch.reqs
+        batch_size = len(reqs)
+
+        # Check if any request has talker state or needs prefill
+        has_talker_state = any(
+            req.talker_needs_prefill or req.talker_codec_ids for req in reqs
+        )
+        if not has_talker_state:
+            # No talker state yet (initial thinker prefill) - model will set talker_needs_prefill
+            return
+
+        # Collect state from each request
+        thinker_done = []
+        talker_step = []
+        prev_codec_id = []
+        prev_residual_codes = []
+        talker_needs_prefill = []
+        prev_sampled_thinker_token = []
+        tts_pad_embed = []
+        codec_eos_token_id = None
+
+        for req in reqs:
+            thinker_done.append(req.thinker_done)
+            talker_step.append(req.talker_step)
+            talker_needs_prefill.append(req.talker_needs_prefill)
+
+            # Prev sampled thinker token for look-ahead (or 0 placeholder)
+            if req.prev_sampled_thinker_token is not None:
+                prev_sampled_thinker_token.append(req.prev_sampled_thinker_token)
+            else:
+                prev_sampled_thinker_token.append(0)  # Placeholder
+
+            # Previous codec token and residual codes for talker input
+            if req.talker_codec_ids:
+                prev_codec_id.append(req.talker_codec_ids[-1])
+            else:
+                prev_codec_id.append(0)  # Placeholder, won't be used
+
+            if req.prev_residual_codes is not None:
+                prev_residual_codes.append(req.prev_residual_codes)
+
+            if req.tts_pad_embed is not None:
+                tts_pad_embed.append(req.tts_pad_embed)
+
+            # Get codec_eos_token_id from first request that has it
+            if codec_eos_token_id is None and req.codec_eos_token_id is not None:
+                codec_eos_token_id = req.codec_eos_token_id
+
+        # Compute talker positions: prefill_len + talker_step for each request
+        # This ensures decode positions continue from where prefill left off
+        talker_positions = torch.tensor(
+            [req.talker_prefill_len + step for req, step in zip(reqs, talker_step)],
+            dtype=torch.long,
+            device=device,
+        )
+
+        self.model_specific_states = {
+            "thinker_done": torch.tensor(thinker_done, dtype=torch.bool, device=device),
+            "talker_step": torch.tensor(talker_step, dtype=torch.long, device=device),
+            "prev_codec_id": torch.tensor(
+                prev_codec_id, dtype=torch.long, device=device
+            ),
+            "talker_positions": talker_positions,
+            "talker_needs_prefill": torch.tensor(
+                talker_needs_prefill, dtype=torch.bool, device=device
+            ),
+            "prev_sampled_thinker_token": torch.tensor(
+                prev_sampled_thinker_token, dtype=torch.long, device=device
+            ),
+        }
+
+        # Add codec_eos_token_id if available
+        if codec_eos_token_id is not None:
+            self.model_specific_states["codec_eos_token_id"] = codec_eos_token_id
+
+        # Stack tts_pad_embed if available
+        if len(tts_pad_embed) == batch_size:
+            self.model_specific_states["tts_pad_embed"] = torch.stack(
+                tts_pad_embed, dim=0
+            )
+
+        # Store prev_residual_codes if available (for talker decode input)
+        # Only first request's codes are used (batch_size=1 assumption for now)
+        if prev_residual_codes and len(prev_residual_codes) >= 1:
+            self.model_specific_states["prev_residual_codes"] = prev_residual_codes[0]
+
+        # Store talker KV cache locations for switching forward_batch during decode
+        # Only first request's locations are used (batch_size=1 assumption for now)
+        if reqs[0].talker_kv_cache_locs is not None:
+            self.model_specific_states["talker_kv_cache_locs"] = reqs[0].talker_kv_cache_locs
+
+        # Store origin_input_ids for talker prefill at first decode (1-step delay)
+        if any(req.talker_needs_prefill for req in reqs):
+            self.model_specific_states["origin_input_ids"] = [
+                torch.tensor(req.origin_input_ids, device=device, dtype=torch.long)
+                for req in reqs
+            ]
 
     def _compute_spec_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch

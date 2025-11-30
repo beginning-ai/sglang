@@ -2341,6 +2341,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 axis=-1,
             )
 
+        # For Qwen3-Omni ThinkerTalkerOutput - extract thinker logits
+        # (talker output is ignored per current requirements)
+        if hasattr(logits_output, "thinker_logits"):
+            if logits_output.thinker_logits is None:
+                # Thinker is done, return dummy token (scheduler will handle this)
+                return torch.zeros(
+                    forward_batch.batch_size, dtype=torch.long, device="cuda"
+                )
+            # thinker_logits is already a LogitsProcessorOutput from logits_processor
+            logits_output = logits_output.thinker_logits
+
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
         # Sample the next tokens
         next_token_ids = self.sampler(

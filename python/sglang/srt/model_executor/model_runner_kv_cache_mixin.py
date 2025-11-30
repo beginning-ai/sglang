@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     HybridLinearKVPool,
+    HybridMultiHeadKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
@@ -79,22 +80,46 @@ class ModelRunnerKVCacheMixin:
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
         else:
-            cell_size = (
-                self.model_config.get_num_kv_heads(get_attention_tp_size())
-                * (self.model_config.head_dim + self.model_config.v_head_dim)
-                * num_layers
-                * kv_size
-            )
+            # Check for heterogeneous models with different KV heads per sub-model
+            if sub_model_kv_configs := self.model_config.get_sub_model_kv_configs(
+                get_attention_tp_size()
+            ):
+                # Calculate accurate cell_size for heterogeneous models
+                cell_size = sum(
+                    config["head_num"]
+                    * self.model_config.head_dim
+                    * len(config["layer_ids"])
+                    * 2
+                    * kv_size
+                    for config in sub_model_kv_configs
+                )
+            else:
+                cell_size = (
+                    self.model_config.get_num_kv_heads(get_attention_tp_size())
+                    * (self.model_config.head_dim + self.model_config.v_head_dim)
+                    * num_layers
+                    * kv_size
+                )
 
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
 
-                n = self.model_config.get_num_kv_heads(get_attention_tp_size())
-                k = self.model_config.head_dim
-                cell_size = (cell_size // 2) + (
-                    (n * k * num_layers * 2 * kv_size) // scale_block_size
-                )
+                if sub_model_kv_configs:
+                    scale_size = sum(
+                        config["head_num"]
+                        * self.model_config.head_dim
+                        * len(config["layer_ids"])
+                        * 2
+                        * kv_size
+                        for config in sub_model_kv_configs
+                    ) // scale_block_size
+                else:
+                    n = self.model_config.get_num_kv_heads(get_attention_tp_size())
+                    k = self.model_config.head_dim
+                    scale_size = (n * k * num_layers * 2 * kv_size) // scale_block_size
+
+                cell_size = (cell_size // 2) + scale_size
 
             if "MiMoV2FlashForCausalLM" in self.model_config.hf_config.architectures:
                 cell_size += (
@@ -553,6 +578,19 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
                     **extra_args,
+                )
+            elif sub_model_kv_configs := self.model_config.get_sub_model_kv_configs(
+                get_attention_tp_size()
+            ):
+                # Models with heterogeneous sub-models (different num_kv_heads)
+                self.token_to_kv_pool = HybridMultiHeadKVPool(
+                    size=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_dim=self.model_config.head_dim,
+                    sub_model_configs=sub_model_kv_configs,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
                 )
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
