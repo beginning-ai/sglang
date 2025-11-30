@@ -372,6 +372,7 @@ class Qwen3OmniMoeTalkerTextConfig(PretrainedConfig):
         attention_dropout=0,
         decoder_sparse_step=1,
         moe_intermediate_size=384,
+        shared_expert_intermediate_size=768,
         num_experts_per_tok=8,
         num_experts=128,
         norm_topk_prob=False,
@@ -410,6 +411,7 @@ class Qwen3OmniMoeTalkerTextConfig(PretrainedConfig):
         # MoE arguments
         self.decoder_sparse_step = decoder_sparse_step
         self.moe_intermediate_size = moe_intermediate_size
+        self.shared_expert_intermediate_size = shared_expert_intermediate_size
         self.num_experts_per_tok = num_experts_per_tok
         self.num_experts = num_experts
         self.norm_topk_prob = norm_topk_prob

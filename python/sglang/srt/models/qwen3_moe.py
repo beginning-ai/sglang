@@ -59,7 +59,7 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
-from sglang.srt.models.qwen2_moe import Qwen2MoeModel
+from sglang.srt.models.qwen2_moe import Qwen2MoeModel, Qwen2MoeSparseMoeBlock
 from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
@@ -290,6 +290,7 @@ class Qwen3MoeAttention(nn.Module):
         prefix: str = "",
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        sliding_window_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -359,6 +360,7 @@ class Qwen3MoeAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            sliding_window_size=sliding_window_size if sliding_window_size else -1,
             prefix=add_prefix("attn", prefix),
         )
 
@@ -509,6 +511,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_layer_sparse: bool = True,
+        is_previous_layer_sparse: bool = True,
+        sliding_window_size: Optional[int] = None,
+        sparse_moe_block_type=Qwen3MoeSparseMoeBlock,
     ) -> None:
         super().__init__()
         self.config = config
@@ -539,6 +545,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             dual_chunk_attention_config=dual_chunk_attention_config,
             alt_stream=alt_stream,
+            sliding_window_size=sliding_window_size,
         )
 
         self.layer_id = layer_id
@@ -546,9 +553,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
-        # Qwen3MoE all layers are sparse and have no nextn now
-        self.is_layer_sparse = True
-        is_previous_layer_sparse = True
+        self.is_layer_sparse = is_layer_sparse
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -558,7 +563,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = Qwen3MoeSparseMoeBlock(
+            self.mlp = sparse_moe_block_type(
                 layer_id=self.layer_id,
                 config=config,
                 quant_config=quant_config,

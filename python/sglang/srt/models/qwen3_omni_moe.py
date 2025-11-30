@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Inference-only Qwen3-VL model compatible with HuggingFace weights."""
+"""Inference-only Qwen3-Omni model compatible with HuggingFace weights."""
+import functools
 import math
 from typing import Iterable, List, Optional, Tuple
 
@@ -23,27 +24,38 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeTalkerResizeMLP,
+)
 
 from sglang.srt.configs.qwen3_omni import (
     Qwen3OmniMoeAudioEncoderConfig,
+    Qwen3OmniMoeConfig,
+    Qwen3OmniMoeTalkerCodePredictorConfig,
+    Qwen3OmniMoeTalkerConfig,
+    Qwen3OmniMoeTalkerTextConfig,
     Qwen3OmniMoeThinkerConfig,
     Qwen3OmniMoeVisionEncoderConfig,
 )
-from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeModel
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 from sglang.srt.models.qwen3_vl_moe import (
     Qwen3MoeLLMModel,
     Qwen3VLMoeForConditionalGeneration,
     load_fused_expert_weights,
 )
-from sglang.srt.utils import add_prefix, logger
+from sglang.srt.utils import add_prefix, is_cuda, logger, make_layers
 
 
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
@@ -465,10 +477,127 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         return audio_features
 
 
+# ==================== Talker Modules ====================
+
+
+class Qwen3OmniMoeTalkerCodePredictorModel(Qwen3MoeModel):
+    """Code predictor model with ModuleList of embeddings for each code group."""
+
+    def __init__(
+        self,
+        config: Qwen3OmniMoeTalkerCodePredictorConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__(
+            config,
+            quant_config=quant_config,
+            prefix=prefix,
+            decoder_layer_type=functools.partial(
+                Qwen3MoeDecoderLayer,
+                is_layer_sparse=False,
+                is_previous_layer_sparse=False,
+            )
+        )
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = nn.ModuleList(
+                [
+                    VocabParallelEmbedding(
+                        config.vocab_size,
+                        config.hidden_size,
+                        prefix=add_prefix(f"embed_tokens.{i}", prefix),
+                    )
+                    for i in range(config.num_code_groups - 1)
+                ]
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+
+class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
+    """Code predictor for conditional generation with ModuleList of lm_heads."""
+
+    def __init__(
+        self,
+        config: Qwen3OmniMoeTalkerCodePredictorConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.config = config
+
+        self.model = Qwen3OmniMoeTalkerCodePredictorModel(
+            config=config,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
+        )
+
+        # ModuleList of lm_heads for each code group (num_code_groups - 1)
+        num_heads = config.num_code_groups - 1
+        self.lm_head = nn.ModuleList(
+            [
+                nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+                for _ in range(num_heads)
+            ]
+        )
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration.forward is not implemented"
+        )
+
+class Qwen3OmniMoeTalkerForConditionalGeneration(nn.Module):
+    """Top-level Talker module with projections, codec_head, model, and code_predictor."""
+
+    def __init__(
+        self,
+        config: Qwen3OmniMoeTalkerConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.config = config
+        text_config = config.text_config
+
+        self.text_projection = Qwen3OmniMoeTalkerResizeMLP(config)
+        self.hidden_projection = Qwen3OmniMoeTalkerResizeMLP(config)
+
+        self.codec_head = nn.Linear(
+            text_config.hidden_size, text_config.vocab_size, bias=False
+        )
+
+        self.model = Qwen3MoeModel(
+            config=text_config,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
+            decoder_layer_type=functools.partial(
+                Qwen3MoeDecoderLayer,
+                is_layer_sparse=True,
+                is_previous_layer_sparse=True,
+                sparse_moe_block_type=Qwen2MoeSparseMoeBlock,
+            ),
+        )
+
+        # Code predictor
+        self.code_predictor = Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(
+            config=config.code_predictor_config,
+            quant_config=quant_config,
+            prefix=add_prefix("code_predictor", prefix),
+        )
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Qwen3OmniMoeTalkerForConditionalGeneration.forward is not implemented"
+        )
+
+
+# ==================== Main Model ====================
+
+
 class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
     def __init__(
         self,
-        config: Qwen3VLMoeConfig,
+        config: Qwen3OmniMoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -478,7 +607,11 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         self.thinker = Qwen3OmniMoeThinkerForConditionalGeneration(
             config.thinker_config, quant_config=quant_config, prefix=prefix
         )
-        self.enable_talker = False
+        self.talker = Qwen3OmniMoeTalkerForConditionalGeneration(
+            config=config.talker_config,
+            quant_config=quant_config,
+            prefix="talker",
+        )
         self.pad_input_ids = self.thinker.pad_input_ids
         self.forward = self.thinker.forward
 
@@ -492,11 +625,22 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
             ("gate_up_proj", "gate_proj", 0),
         ]
 
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        # Get num_experts for thinker and talker (they may differ)
+        thinker_num_experts = self.config.thinker_config.text_config.num_experts
+        talker_num_experts = self.config.talker_config.text_config.num_experts
+
+        thinker_expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=thinker_num_experts,
+        )
+
+        talker_expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=talker_num_experts,
         )
 
         # Skip loading extra parameters for GPTQ/modelopt models.
@@ -519,8 +663,6 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
         ]
 
-        num_experts = self.config.num_experts
-
         # Cache params_dict to avoid repeated expensive traversal of model parameters
         if not hasattr(self, "_cached_params_dict"):
             self._cached_params_dict = dict(self.named_parameters())
@@ -529,8 +671,29 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         for name, loaded_weight in weights:
             name = name.replace(r"model.language_model.", r"model.")
 
-            if ("talker" in name or "code2wav" in name) and not self.enable_talker:
+            # Skip code2wav weights (not yet implemented)
+            if "code2wav" in name:
                 continue
+
+            # Rename codec_embedding to embed_tokens for talker model and code predictor
+            if "talker.model.codec_embedding" in name:
+                name = name.replace(
+                    "talker.model.codec_embedding", "talker.model.embed_tokens"
+                )
+            if "talker.code_predictor.model.codec_embedding" in name:
+                name = name.replace(
+                    "talker.code_predictor.model.codec_embedding",
+                    "talker.code_predictor.model.embed_tokens",
+                )
+
+            # Determine if this is a talker weight and select appropriate expert mapping
+            is_talker_weight = "talker" in name
+            expert_params_mapping = (
+                talker_expert_params_mapping
+                if is_talker_weight
+                else thinker_expert_params_mapping
+            )
+            num_experts = talker_num_experts if is_talker_weight else thinker_num_experts
 
             name = name.replace(".self_attn.out_proj", ".self_attn.proj")
 
