@@ -499,11 +499,17 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
 
+    # Free Qwen3-Omni talker KV cache if present.
+    if getattr(req, "talker_kv_cache_locs", None) is not None:
+        tree_cache.token_to_kv_pool_allocator.free(req.talker_kv_cache_locs)
+        req.talker_kv_cache_locs = None
+
     if start_p < end_p:
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()
@@ -512,6 +518,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx is not None
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
+
     tree_cache.req_to_token_pool.free(req)
 
 
