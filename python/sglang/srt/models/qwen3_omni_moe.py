@@ -33,11 +33,9 @@ from sglang.srt.configs.qwen3_omni import (
     Qwen3OmniMoeConfig,
     Qwen3OmniMoeTalkerCodePredictorConfig,
     Qwen3OmniMoeTalkerConfig,
-    Qwen3OmniMoeTalkerTextConfig,
     Qwen3OmniMoeThinkerConfig,
     Qwen3OmniMoeVisionEncoderConfig,
 )
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -46,6 +44,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeModel
@@ -55,7 +54,8 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration,
     load_fused_expert_weights,
 )
-from sglang.srt.utils import add_prefix, is_cuda, logger, make_layers
+from sglang.srt.speculative.spec_utils import fast_topk
+from sglang.srt.utils import add_prefix, logger
 
 
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
@@ -541,10 +541,140 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
             ]
         )
 
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError(
-            "Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration.forward is not implemented"
+    def get_input_embeddings(self) -> nn.ModuleList:
+        return self.model.embed_tokens
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        generation_steps: int = 0,
+    ) -> torch.Tensor:
+        """
+        Forward pass for code predictor.
+
+        Args:
+            input_ids: Input token ids
+            positions: Position indices
+            forward_batch: Forward batch info
+            input_embeds: Optional pre-computed embeddings (for prefill stage)
+            generation_steps: Current generation step (0 to num_code_groups-2),
+                              selects which embedding and lm_head to use
+
+        Returns:
+            logits: Output logits from the selected lm_head
+        """
+        
+        if input_embeds is not None and input_embeds.shape[0] > 1:
+            # Prefill stage
+            generation_steps = input_embeds.shape[0] - 2
+        else:
+            # Generation stage
+            embed_layer = self.model.embed_tokens[generation_steps - 1]
+            input_embeds = embed_layer(input_ids)
+
+        hidden_states = self.model(
+            input_ids=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
         )
+
+        lm_head = self.lm_head[generation_steps]
+        logits = lm_head(hidden_states)
+
+        return logits
+
+    def _sample(
+        self,
+        logits: torch.Tensor,
+        do_sample: bool = True,
+        top_k: int = 50,
+    ) -> torch.Tensor:
+        probs = torch.softmax(logits, dim=-1)
+        if do_sample:
+            topk_p, topk_ids = fast_topk(probs, top_k, dim=-1)
+            # Sample from top-k distribution
+            idx = torch.multinomial(topk_p, 1)
+            next_token = torch.gather(topk_ids, -1, idx)
+        else:
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+        return next_token
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_embeds: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        num_tokens: int,
+        do_sample: bool = True,
+        top_k: int = 50,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Generate num_tokens codes autoregressively.
+
+        Args:
+            input_embeds: Initial embeddings (batch, seq_len, hidden) - typically
+                          past_hidden concatenated with last_id_hidden
+            positions: Position indices for the input
+            forward_batch: Forward batch info
+            num_tokens: Number of tokens to generate (num_code_groups - 1)
+            do_sample: Whether to sample (True) or use argmax (False)
+            top_k: Top-k for sampling
+
+        Returns:
+            sequences: Generated token ids (batch, num_tokens)
+            hidden_states_list: List of hidden states from each step
+        """
+        generated_tokens = []
+        hidden_states_list = []
+
+        # First forward with input_embeds (prefill for code predictor)
+        hidden_states = self.model(
+            input_ids=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+        )
+        logits = self.lm_head[0](hidden_states[:, -1:])
+
+        # Sample first token
+        next_token = self._sample(logits, do_sample, top_k)
+        generated_tokens.append(next_token)
+        hidden_states_list.append(hidden_states[:, -1:])
+
+        # Generate remaining tokens
+        for step in range(1, num_tokens):
+            # Get embedding for the token we just generated
+            embed_layer = self.model.embed_tokens[step - 1]
+            step_embeds = embed_layer(next_token)
+
+            # Increment positions
+            positions = positions[:, -1:] + 1
+
+            # Forward pass
+            hidden_states = self.model(
+                input_ids=None,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=step_embeds,
+            )
+
+            # Use appropriate lm_head for this step
+            logits = self.lm_head[step](hidden_states)
+
+            # Sample next token
+            next_token = self._sample(logits, do_sample, top_k)
+            generated_tokens.append(next_token)
+            hidden_states_list.append(hidden_states)
+
+        sequences = torch.cat(generated_tokens, dim=-1)
+        return sequences, hidden_states_list
+
 
 class Qwen3OmniMoeTalkerForConditionalGeneration(nn.Module):
     """Top-level Talker module with projections, codec_head, model, and code_predictor."""
