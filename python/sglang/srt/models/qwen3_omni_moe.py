@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only Qwen3-Omni model compatible with HuggingFace weights."""
+
 import functools
 import math
 from typing import Iterable, List, Optional, Tuple
@@ -117,9 +118,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
 
         if hidden_states.dtype == torch.float16:
             clamp_value = torch.finfo(hidden_states.dtype).max - 1000
-            hidden_states = torch.clamp(
-                hidden_states, min=-clamp_value, max=clamp_value
-            )
+            hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
 
         outputs = (hidden_states,)
 
@@ -132,12 +131,8 @@ class SinusoidsPositionEmbedding(nn.Module):
         if channels % 2 != 0:
             raise ValueError("SinusoidsPositionEmbedding needs even channels input")
         log_timescale_increment = np.log(max_timescale) / (channels // 2 - 1)
-        inv_timescales = torch.exp(
-            -log_timescale_increment * torch.arange(channels // 2).float()
-        )
-        scaled_time = (
-            torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
-        )
+        inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2).float())
+        scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
         self.register_buffer(
             "positional_embedding",
             torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1),
@@ -155,9 +150,7 @@ def _get_feat_extract_output_lengths(input_lengths):
 
     input_lengths_leave = input_lengths % 100
     feat_lengths = (input_lengths_leave - 1) // 2 + 1
-    output_lengths = (
-        ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
-    )
+    output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
     return output_lengths
 
 
@@ -173,14 +166,9 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         self.max_source_positions = config.max_source_positions
         self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
         self.n_window = config.n_window
-        self.positional_embedding = SinusoidsPositionEmbedding(
-            self.max_source_positions, embed_dim
-        )
+        self.positional_embedding = SinusoidsPositionEmbedding(self.max_source_positions, embed_dim)
         self.layers = nn.ModuleList(
-            [
-                Qwen3OmniMoeAudioEncoderLayer(config)
-                for _ in range(config.encoder_layers)
-            ]
+            [Qwen3OmniMoeAudioEncoderLayer(config) for _ in range(config.encoder_layers)]
         )
         self.ln_post = nn.LayerNorm(config.d_model)
         self.gradient_checkpointing = False
@@ -200,8 +188,7 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
             padding=1,
         )
         self.conv_out = nn.Linear(
-            config.downsample_hidden_size
-            * ((((config.num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2),
+            config.downsample_hidden_size * ((((config.num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2),
             config.d_model,
             bias=False,
         )
@@ -247,9 +234,7 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         chunk_lengths[chunk_lengths == 0] = self.n_window * 2
 
         chunk_list = input_features.T.split(chunk_lengths.tolist(), dim=0)
-        padded_feature = nn.utils.rnn.pad_sequence(
-            chunk_list, batch_first=True
-        ).transpose(1, 2)
+        padded_feature = nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
         feature_lens_after_cnn = _get_feat_extract_output_lengths(chunk_lengths)
         padded_mask_after_cnn = nn.utils.rnn.pad_sequence(
             [
@@ -317,7 +302,6 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
 
 
 class Qwen3OmniMoeVisionPatchMerger(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -330,9 +314,7 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.use_postshuffle_norm = use_postshuffle_norm
-        self.ln_q = RMSNorm(
-            self.hidden_size if use_postshuffle_norm else context_dim, eps=1e-6
-        )
+        self.ln_q = RMSNorm(self.hidden_size if use_postshuffle_norm else context_dim, eps=1e-6)
         self.mlp = nn.ModuleList(
             [
                 ColumnParallelLinear(
@@ -354,11 +336,7 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = (
-            x.view(-1, self.hidden_size)
-            if self.use_postshuffle_norm
-            else x.view(-1, x.shape[-1])
-        )
+        x = x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x.view(-1, x.shape[-1])
         hidden = self.ln_q(x).view(-1, self.hidden_size)
         for layer in self.mlp:
             if isinstance(hidden, tuple):
@@ -432,9 +410,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        super().__init__(
-            config, quant_config, prefix, language_model_cls=Qwen3MoeLLMModel
-        )
+        super().__init__(config, quant_config, prefix, language_model_cls=Qwen3MoeLLMModel)
         self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config)
         self.visual = Qwen3OmniMoeVisionEncoder(
             config.vision_config,
@@ -442,9 +418,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             prefix=add_prefix("visual", prefix),
         )
-        self.pad_token_id = (
-            self.config.pad_token_id if self.config.pad_token_id is not None else -1
-        )
+        self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
 
     def get_audio_feature(self, items: List[MultimodalDataItem]):
         feature_attention_mask = torch.cat(
@@ -457,9 +431,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         )
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-            input_features = input_features.permute(0, 2, 1)[
-                feature_attention_mask.bool()
-            ].permute(1, 0)
+            input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(
+                1, 0
+            )
         else:
             audio_feature_lengths = None
 
@@ -497,7 +471,7 @@ class Qwen3OmniMoeTalkerCodePredictorModel(Qwen3MoeModel):
                 Qwen3MoeDecoderLayer,
                 is_layer_sparse=False,
                 is_previous_layer_sparse=False,
-            )
+            ),
         )
         if self.pp_group.is_first_rank:
             self.embed_tokens = nn.ModuleList(
@@ -535,10 +509,7 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
         # ModuleList of lm_heads for each code group (num_code_groups - 1)
         num_heads = config.num_code_groups - 1
         self.lm_head = nn.ModuleList(
-            [
-                nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-                for _ in range(num_heads)
-            ]
+            [nn.Linear(config.hidden_size, config.vocab_size, bias=False) for _ in range(num_heads)]
         )
 
     def get_input_embeddings(self) -> nn.ModuleList:
@@ -567,7 +538,7 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
         Returns:
             logits: Output logits from the selected lm_head
         """
-        
+
         if input_embeds is not None and input_embeds.shape[0] > 1:
             # Prefill stage
             generation_steps = input_embeds.shape[0] - 2
@@ -692,9 +663,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(nn.Module):
         self.text_projection = Qwen3OmniMoeTalkerResizeMLP(config)
         self.hidden_projection = Qwen3OmniMoeTalkerResizeMLP(config)
 
-        self.codec_head = nn.Linear(
-            text_config.hidden_size, text_config.vocab_size, bias=False
-        )
+        self.codec_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
 
         self.model = Qwen3MoeModel(
             config=text_config,
@@ -715,10 +684,98 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(nn.Module):
             prefix=add_prefix("code_predictor", prefix),
         )
 
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError(
-            "Qwen3OmniMoeTalkerForConditionalGeneration.forward is not implemented"
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        past_hidden: torch.Tensor = None,
+        trailing_text_hidden: torch.Tensor = None,
+        tts_pad_embed: torch.Tensor = None,
+        generation_step: int = 0,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, int]:
+        """
+        Talker forward pass.
+
+        Args:
+            input_ids: Input token ids (sampled first codec code in decode stage)
+            positions: Position indices
+            forward_batch: Forward batch info
+            input_embeds: Pre-computed embeddings (for prefill stage)
+            past_hidden: Hidden state from previous talker forward (for decode stage)
+            trailing_text_hidden: Text hidden states from thinker
+            tts_pad_embed: Embedding for tts_pad_token_id
+            generation_step: Current generation step
+
+        Returns:
+            logits: Codec logits from codec_head
+            residual_codes: All generated codes (first + predictor), or None for prefill
+            hidden_states: Hidden states for next decode step
+            next_generation_step: Incremented generation step
+        """
+        # Prefill stage: input_embeds provided with seq_len > 1
+        if input_embeds is not None and input_embeds.shape[1] > 1:
+            hidden_states = self.model(
+                input_ids=None,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+            )
+            logits = self.codec_head(hidden_states)
+            return logits, None, hidden_states, 0
+
+        # Decode stage: prepare input_embeds via code predictor FIRST
+        # 1. Get embedding of the sampled first code
+        last_id_hidden = self.model.embed_tokens(input_ids)
+
+        # 2. Generate residual codes via code predictor
+        predictor_input = torch.cat((past_hidden, last_id_hidden), dim=1)
+        residual_codes, predictor_hiddens = self.code_predictor.generate(
+            input_embeds=predictor_input,
+            positions=positions,
+            forward_batch=forward_batch,
+            num_tokens=self.config.code_predictor_config.num_code_groups - 1,
         )
+
+        # 3. Combine first code with residual codes
+        all_codes = torch.cat((input_ids, residual_codes), dim=-1)
+
+        # 4. Compute input_embeds for talker model
+        last_residual_hidden = self.code_predictor.get_input_embeddings()[-1](
+            residual_codes[:, -1:]
+        )
+
+        codec_hiddens = torch.cat(
+            [last_id_hidden] + predictor_hiddens + [last_residual_hidden],
+            dim=1,
+        )
+        input_embeds = codec_hiddens.sum(dim=1, keepdim=True)
+
+        # 5. Add trailing_text_hidden from thinker
+        if trailing_text_hidden is not None:
+            if generation_step < trailing_text_hidden.shape[1]:
+                input_embeds = (
+                    input_embeds + trailing_text_hidden[:, generation_step : generation_step + 1]
+                )
+            elif tts_pad_embed is not None:
+                input_embeds = input_embeds + tts_pad_embed
+
+        # 6. Run talker model with prepared input_embeds
+        hidden_states = self.model(
+            input_ids=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+        )
+
+        logits = self.codec_head(hidden_states)
+
+        return logits, all_codes, hidden_states, generation_step + 1
 
 
 # ==================== Main Model ====================
@@ -807,9 +864,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
 
             # Rename codec_embedding to embed_tokens for talker model and code predictor
             if "talker.model.codec_embedding" in name:
-                name = name.replace(
-                    "talker.model.codec_embedding", "talker.model.embed_tokens"
-                )
+                name = name.replace("talker.model.codec_embedding", "talker.model.embed_tokens")
             if "talker.code_predictor.model.codec_embedding" in name:
                 name = name.replace(
                     "talker.code_predictor.model.codec_embedding",
@@ -819,9 +874,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
             # Determine if this is a talker weight and select appropriate expert mapping
             is_talker_weight = "talker" in name
             expert_params_mapping = (
-                talker_expert_params_mapping
-                if is_talker_weight
-                else thinker_expert_params_mapping
+                talker_expert_params_mapping if is_talker_weight else thinker_expert_params_mapping
             )
             num_experts = talker_num_experts if is_talker_weight else thinker_num_experts
 
@@ -903,10 +956,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                             )
                     else:
                         # Skip loading extra parameters for GPTQ/modelopt models.
-                        if (
-                            name_mapped.endswith(ignore_suffixes)
-                            and name_mapped not in params_dict
-                        ):
+                        if name_mapped.endswith(ignore_suffixes) and name_mapped not in params_dict:
                             continue
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or
@@ -938,14 +988,10 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
 
                     if name in params_dict.keys():
                         param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
                         weight_loader(param, loaded_weight)
                     else:
-                        logger.warning(
-                            f"Loaded weight with {name=} not found in params_dict"
-                        )
+                        logger.warning(f"Loaded weight with {name=} not found in params_dict")
 
 
 EntryClass = Qwen3OmniMoeForConditionalGeneration
