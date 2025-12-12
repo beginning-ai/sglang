@@ -271,6 +271,7 @@ sgl-kernel/csrc/**/*_musa/
 
 # MUSA core dump files
 *.mudmp
+uv.lock
 
 # Others
 # diffusion 3D outputs

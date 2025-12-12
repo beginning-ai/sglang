@@ -1,0 +1,4 @@
+interface:
+  display_name: "JJ Resolve Conflicts"
+  short_description: "Resolve merge conflicts in Jujutsu repos"
+  default_prompt: "Use $jj-resolve to resolve conflicted commits in this repository one by one."
