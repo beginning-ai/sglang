@@ -186,48 +186,50 @@ def _update_qwen3_omni_state(
     if not hasattr(logits_output, "talker_needs_prefill"):
         return
 
-    # Handle talker_needs_prefill flag from model output
-    if hasattr(logits_output, "talker_needs_prefill") and logits_output.talker_needs_prefill:
+    if logits_output.talker_needs_prefill:
         req.talker_needs_prefill = True
 
-    # Store thinker token for talker look-ahead (shift by 1 step)
-    # Current token becomes prev_sampled for next step
     if thinker_token_id is not None:
         req.prev_sampled_thinker_token = thinker_token_id
 
-    # Handle complete codec_frame from model (16 codes: first codec + 15 residuals)
-    if logits_output.codec_frame is not None:
-        frame = logits_output.codec_frame
-        codec_token = frame[0]  # First codec token
-        residual_codes = frame[1:]  # 15 residual codes
+    # Handle codec frames
+    frame = None
+    if logits_output.codec_frames is not None and req_idx < len(logits_output.codec_frames):
+        frame = logits_output.codec_frames[req_idx]
 
-        # Store for next decode step input
+    if frame is not None:
+        codec_token = frame[0]
+        residual_codes = frame[1:]
         req.talker_codec_ids.append(codec_token)
         req.prev_residual_codes = residual_codes
+        if codec_token != req.codec_eos_token_id:
+            req.talker_output_codes.append(frame)
 
-        # Store complete frame for Code2Wav
-        req.talker_output_codes.append(frame)
-
-    # Store tts_pad_embed (only set during prefill, for use when thinker finishes)
     if logits_output.tts_pad_embed is not None:
         if logits_output.tts_pad_embed.dim() == 2:
             req.tts_pad_embed = logits_output.tts_pad_embed[req_idx].detach()
         else:
             req.tts_pad_embed = logits_output.tts_pad_embed.detach()
 
-    # Store talker KV cache location for cleanup at request end (set during talker prefill)
-    if logits_output.talker_out_cache_loc is not None:
-        req.talker_kv_cache_locs = logits_output.talker_out_cache_loc
-        req.talker_prefill_len = len(logits_output.talker_out_cache_loc)
-        # Clear the prefill flag after talker prefill runs
-        req.talker_needs_prefill = False
+    # Handle talker KV cache locations (prefill)
+    if logits_output.talker_out_cache_loc_list is not None:
+        if req_idx < len(logits_output.talker_out_cache_loc_list):
+            kv_locs = logits_output.talker_out_cache_loc_list[req_idx]
+            if kv_locs is not None:
+                req.talker_kv_cache_locs = kv_locs
+                req.talker_prefill_len = len(kv_locs)
+                req.talker_needs_prefill = False
 
-    # Update talker KV cache locations during decode (includes newly allocated token)
-    if hasattr(logits_output, "updated_talker_kv_locs") and logits_output.updated_talker_kv_locs is not None:
-        req.talker_kv_cache_locs = logits_output.updated_talker_kv_locs
+    # Handle talker KV cache locations (decode)
+    if logits_output.updated_talker_kv_locs_list is not None:
+        if req_idx < len(logits_output.updated_talker_kv_locs_list):
+            kv_locs = logits_output.updated_talker_kv_locs_list[req_idx]
+            if kv_locs is not None:
+                req.talker_kv_cache_locs = kv_locs
 
     # Increment talker step when talker produces a frame (not during prefill)
-    if logits_output.codec_frame is not None and logits_output.talker_out_cache_loc is None:
+    is_prefill = logits_output.talker_out_cache_loc_list is not None
+    if frame is not None and not is_prefill:
         req.talker_step += 1
 
     # Trigger Code2Wav decode if model is available

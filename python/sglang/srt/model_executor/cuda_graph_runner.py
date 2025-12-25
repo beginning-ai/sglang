@@ -888,7 +888,7 @@ class CudaGraphRunner:
             output_cls = type(output)
             return output_cls(
                 thinker_logits=sliced_thinker_logits,
-                codec_frame=output.codec_frame,
+                codec_frames=output.codec_frames,
                 tts_pad_embed=output.tts_pad_embed,
             )
         else:

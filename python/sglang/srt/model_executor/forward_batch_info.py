@@ -740,15 +740,16 @@ class ForwardBatch:
                 tts_pad_embed, dim=0
             )
 
-        # Store prev_residual_codes if available (for talker decode input)
-        # Only first request's codes are used (batch_size=1 assumption for now)
-        if prev_residual_codes and len(prev_residual_codes) >= 1:
-            self.model_specific_states["prev_residual_codes"] = prev_residual_codes[0]
+        # Store prev_residual_codes as [batch_size, 15] tensor for batched talker decode
+        if prev_residual_codes and len(prev_residual_codes) == batch_size:
+            self.model_specific_states["prev_residual_codes"] = torch.tensor(
+                prev_residual_codes, dtype=torch.long, device=device
+            )  # [batch_size, 15]
 
-        # Store talker KV cache locations for switching forward_batch during decode
-        # Only first request's locations are used (batch_size=1 assumption for now)
-        if reqs[0].talker_kv_cache_locs is not None:
-            self.model_specific_states["talker_kv_cache_locs"] = reqs[0].talker_kv_cache_locs
+        # Store talker KV cache locations as list (variable length per request)
+        talker_kv_cache_locs_list = [req.talker_kv_cache_locs for req in reqs]
+        if any(locs is not None for locs in talker_kv_cache_locs_list):
+            self.model_specific_states["talker_kv_cache_locs_list"] = talker_kv_cache_locs_list
 
         # Store origin_input_ids for talker prefill at first decode (1-step delay)
         if any(req.talker_needs_prefill for req in reqs):

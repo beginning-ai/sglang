@@ -1972,26 +1972,61 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
-        # Allocate memory
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        # Check for Qwen3-Omni thinker_done requests
+        thinker_done_mask = [req.thinker_done for req in self.reqs]
+        all_thinker_done = all(thinker_done_mask)
+        any_thinker_done = any(thinker_done_mask)
 
-        # Update req-level memory management fields
-        for req in self.reqs:
-            req.kv_committed_len += 1
-            req.kv_allocated_len += 1
-
-        # Update seq_lens after allocation
-        if self.enable_overlap:
-            # Do not use in-place operations in the overlap mode
-            self.seq_lens = self.seq_lens + 1
-            self.seq_lens_cpu = self.seq_lens_cpu + 1
-            self.orig_seq_lens = self.orig_seq_lens + 1
+        if all_thinker_done:
+            # Skip thinker KV allocation for pure talker-only batches
+            # Talker uses its own KV cache managed separately
+            self.out_cache_loc = None
         else:
-            # A faster in-place version
-            self.seq_lens.add_(1)
-            self.seq_lens_cpu.add_(1)
-            self.orig_seq_lens.add_(1)
-        self.seq_lens_sum += bs
+            # Allocate memory for thinker
+            self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+
+            # Update req-level memory management fields and handle mixed batches
+            if any_thinker_done:
+                # Mixed batch: some requests are thinker_done
+                # Free allocated tokens for thinker_done requests immediately
+                for i, (req, done) in enumerate(zip(self.reqs, thinker_done_mask)):
+                    if done:
+                        # Free the token that was allocated for this thinker_done request
+                        self.tree_cache.token_to_kv_pool_allocator.free(
+                            self.out_cache_loc[i:i+1]
+                        )
+                    else:
+                        req.kv_committed_len += 1
+                        req.kv_allocated_len += 1
+
+                # Update seq_lens only for non-thinker_done requests
+                device = self.seq_lens.device
+                increment = torch.tensor(
+                    [0 if done else 1 for done in thinker_done_mask],
+                    dtype=self.seq_lens.dtype,
+                    device=device,
+                )
+                self.seq_lens = self.seq_lens + increment
+                self.seq_lens_cpu = self.seq_lens_cpu + increment.cpu()
+                self.orig_seq_lens = self.orig_seq_lens + increment
+                self.seq_lens_sum += increment.sum().item()
+            else:
+                # No thinker_done requests, normal path
+                for req in self.reqs:
+                    req.kv_committed_len += 1
+                    req.kv_allocated_len += 1
+
+                if self.enable_overlap:
+                    # Do not use in-place operations in the overlap mode
+                    self.seq_lens = self.seq_lens + 1
+                    self.seq_lens_cpu = self.seq_lens_cpu + 1
+                    self.orig_seq_lens = self.orig_seq_lens + 1
+                else:
+                    # A faster in-place version
+                    self.seq_lens.add_(1)
+                    self.seq_lens_cpu.add_(1)
+                    self.orig_seq_lens.add_(1)
+                self.seq_lens_sum += bs
 
         if get_global_server_args().enable_mamba_extra_buffer():
             self.mamba_track_indices = torch.tensor(
