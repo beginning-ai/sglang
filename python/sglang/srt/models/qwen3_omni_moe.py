@@ -66,58 +66,156 @@ from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import add_prefix, is_npu, logger
 
 
-def _sample_codec_token(
+TALKER_TEMPERATURE_DEFAULT = 0.9
+TALKER_TOP_K_DEFAULT = 50
+TALKER_TOP_P_DEFAULT = 1.0
+TALKER_REPETITION_PENALTY_DEFAULT = 1.05
+
+
+def _sample_codec_tokens(
     logits: torch.Tensor,
     codec_eos_token_id: int = 2150,
-) -> int:
-    """Sample a codec token from talker logits using hardcoded params.
+    temperature: Union[float, torch.Tensor] = TALKER_TEMPERATURE_DEFAULT,
+    top_k: Union[int, torch.Tensor] = TALKER_TOP_K_DEFAULT,
+    top_p: Union[float, torch.Tensor] = TALKER_TOP_P_DEFAULT,
+    repetition_penalty: Union[float, torch.Tensor] = TALKER_REPETITION_PENALTY_DEFAULT,
+    prev_tokens: Optional[Union[List[int], List[List[int]]]] = None,
+) -> torch.Tensor:
+    """Sample codec tokens from logits. Works for both single and batched inputs.
 
-    Sampling params from transformers reference implementation:
-    - do_sample=True, top_k=50, top_p=1.0, temperature=0.9
-    - suppress_tokens: [vocab_size-1024, vocab_size) except codec_eos_token_id
+    Args:
+        logits: [vocab_size] or [batch_size, vocab_size]
+        codec_eos_token_id: EOS token to preserve during suppression
+        temperature: Sampling temperature
+        top_k: Top-k sampling parameter
+        top_p: Top-p (nucleus) sampling parameter
+        repetition_penalty: Repetition penalty for previously generated tokens
+        prev_tokens: Previous codec tokens for repetition penalty
+
+    Returns:
+        tokens: [] scalar or [batch_size] tensor of sampled token IDs
     """
-    vocab_size = logits.shape[-1]
+    def _apply_repetition_penalty(
+        single_logits: torch.Tensor,
+        token_ids: Optional[List[int]],
+        penalty: float,
+    ) -> torch.Tensor:
+        if not token_ids or penalty == 1.0:
+            return single_logits
+        unique_tokens = torch.tensor(
+            list(set(token_ids)), device=single_logits.device, dtype=torch.long
+        )
+        penalized = single_logits[unique_tokens]
+        penalized = torch.where(
+            penalized < 0, penalized * penalty, penalized / penalty
+        )
+        single_logits[unique_tokens] = penalized
+        return single_logits
 
-    # Suppress special tokens in the last 1024 vocab IDs except codec_eos
-    suppress_start = vocab_size - 1024
-    suppress_mask = torch.zeros_like(logits, dtype=torch.bool)
-    suppress_mask[..., suppress_start:vocab_size] = True
-    if codec_eos_token_id < vocab_size:
-        suppress_mask[..., codec_eos_token_id] = False
-    logits = logits.masked_fill(suppress_mask, float("-inf"))
+    def _sample_single(
+        single_logits: torch.Tensor,
+        token_ids: Optional[List[int]],
+        temp: float,
+        k: int,
+        p: float,
+        penalty: float,
+    ) -> torch.Tensor:
+        vocab_size = single_logits.shape[-1]
+        single_logits = _apply_repetition_penalty(single_logits, token_ids, penalty)
 
-    # Apply temperature
-    logits = logits / 0.9
+        suppress_start = vocab_size - 1024
+        suppress_mask = torch.zeros_like(single_logits, dtype=torch.bool)
+        suppress_mask[suppress_start:vocab_size] = True
+        if codec_eos_token_id < vocab_size:
+            suppress_mask[codec_eos_token_id] = False
+        single_logits = single_logits.masked_fill(suppress_mask, float("-inf"))
 
-    # Apply top-k filtering
-    top_k = 50
-    indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-    logits = logits.masked_fill(indices_to_remove, float("-inf"))
+        single_logits = single_logits / temp
+        if k <= 0 or k >= vocab_size:
+            probs = F.softmax(single_logits, dim=-1)
+            if p < 1.0:
+                sorted_p, sorted_idx = torch.sort(probs, descending=True, dim=-1)
+                cumsum_p = torch.cumsum(sorted_p, dim=-1)
+                mask = cumsum_p - sorted_p > p
+                sorted_p[mask] = 0.0
+                sorted_p = sorted_p / sorted_p.sum(dim=-1, keepdim=True)
+                sampled = torch.multinomial(sorted_p, 1)
+                sampled_idx = sorted_idx.gather(-1, sampled).squeeze(-1)
+                return sampled_idx
+            return torch.multinomial(probs, 1).squeeze(-1)
 
-    # Probabilistic sampling (top_p=1.0 means no nucleus filtering)
-    probs = torch.softmax(logits, dim=-1)
-    token_id = torch.multinomial(probs, num_samples=1).item()
+        topk_logits, topk_indices = torch.topk(single_logits, k, dim=-1)
+        probs = F.softmax(topk_logits, dim=-1)
+        if p < 1.0:
+            sorted_p, sorted_idx = torch.sort(probs, descending=True, dim=-1)
+            cumsum_p = torch.cumsum(sorted_p, dim=-1)
+            mask = cumsum_p - sorted_p > p
+            sorted_p[mask] = 0.0
+            sorted_p = sorted_p / sorted_p.sum(dim=-1, keepdim=True)
+            sampled = torch.multinomial(sorted_p, 1)
+            sampled_idx = sorted_idx.gather(-1, sampled).squeeze(-1)
+        else:
+            sampled_idx = torch.multinomial(probs, 1).squeeze(-1)
+        return topk_indices.gather(-1, sampled_idx.unsqueeze(-1)).squeeze(-1)
 
-    return token_id
+    single_input = logits.dim() == 1
+    if single_input:
+        logits = logits.unsqueeze(0)
+
+    batch_size = logits.shape[0]
+    if isinstance(temperature, torch.Tensor):
+        temperatures = temperature.tolist()
+    else:
+        temperatures = [float(temperature)] * batch_size
+    if isinstance(top_k, torch.Tensor):
+        top_ks = [int(v) for v in top_k.tolist()]
+    else:
+        top_ks = [int(top_k)] * batch_size
+    if isinstance(top_p, torch.Tensor):
+        top_ps = top_p.tolist()
+    else:
+        top_ps = [float(top_p)] * batch_size
+    if isinstance(repetition_penalty, torch.Tensor):
+        repetition_penalties = repetition_penalty.tolist()
+    else:
+        repetition_penalties = [float(repetition_penalty)] * batch_size
+
+    if prev_tokens is None:
+        prev_tokens_list = [None] * batch_size
+    elif single_input:
+        prev_tokens_list = [prev_tokens]
+    else:
+        prev_tokens_list = prev_tokens
+
+    sampled_tokens = []
+    for i in range(batch_size):
+        sampled_tokens.append(
+            _sample_single(
+                logits[i],
+                prev_tokens_list[i],
+                temperatures[i],
+                top_ks[i],
+                top_ps[i],
+                repetition_penalties[i],
+            )
+        )
+    tokens = torch.stack(sampled_tokens, dim=0)
+
+    if single_input:
+        return tokens.squeeze(0)
+    return tokens
 
 
 @dataclass
 class ThinkerTalkerOutput:
-    """Output from Qwen3-Omni forward pass with both thinker and talker results.
+    """Output from Qwen3-Omni forward pass with both thinker and talker results."""
 
-    With 1-step delay and talker-before-code-predictor design:
-    - talker_needs_prefill: True when talker prefill is deferred (set at thinker prefill)
-    - Talker runs 1 step behind thinker to use actual sampled tokens for look-ahead
-    - Model samples codec and runs code predictor, returning complete 16-code frames
-    """
-
-    thinker_logits: LogitsProcessorOutput  # LogitsProcessorOutput from thinker
-    codec_frame: Optional[List[int]] = None  # Complete 16-code frame [codec, 15 residuals]
-    tts_pad_embed: Optional[torch.Tensor] = None  # Padding embed for talker continuation
-    talker_out_cache_loc: Optional[torch.Tensor] = None  # KV cache allocation (talker prefill)
-    talker_req_idx: Optional[int] = None  # Request pool index for talker's KV cache
-    updated_talker_kv_locs: Optional[torch.Tensor] = None  # Updated KV cache locations (decode)
-    talker_needs_prefill: bool = False  # True when talker prefill is pending
+    thinker_logits: LogitsProcessorOutput
+    codec_frames: Optional[List[List[int]]] = None
+    tts_pad_embed: Optional[torch.Tensor] = None
+    talker_out_cache_loc_list: Optional[List[torch.Tensor]] = None
+    updated_talker_kv_locs_list: Optional[List[torch.Tensor]] = None
+    talker_needs_prefill: bool = False
 
     # Delegate LogitsProcessorOutput attributes to thinker_logits for compatibility
     # with BatchResult.copy_to_cpu() which expects these attributes
@@ -750,21 +848,7 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
         top_k: int = 50,
         top_p: float = 0.8,
     ) -> torch.Tensor:
-        """
-        Generate num_tokens codes autoregressively.
-
-        Args:
-            input_embeds: Initial embeddings [seq_len, hidden] - typically
-                          past_hidden concatenated with last_id_hidden
-            forward_batch: Forward batch info
-            num_tokens: Number of tokens to generate (num_code_groups - 1)
-            do_sample: Whether to sample (True) or use argmax (False)
-            top_k: Top-k for sampling
-            top_p: Nucleus sampling threshold (default 0.8 to match transformers)
-
-        Returns:
-            sequences: Generated token ids (batch, num_tokens)
-        """
+        """Generate num_tokens codes autoregressively."""
         device = input_embeds.device
         generated_tokens = []
         all_locs = []
@@ -794,6 +878,11 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
         if predictor_req_slots is None:
             raise RuntimeError("Failed to allocate request slot for code predictor")
         predictor_req_idx = predictor_req_slots[0]
+
+        # Clear any stale KV locations from previous use of this slot.
+        # This is necessary because slots are reused across requests in a batch loop,
+        # and stale indices could cause the attention backend to read wrong KV cache.
+        req_to_token_pool.req_to_token[predictor_req_idx, :] = 0
 
         # Set code predictor's req_pool_indices
         forward_batch.req_pool_indices = torch.tensor(
@@ -913,6 +1002,192 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
         sequences = torch.cat(generated_tokens, dim=0).unsqueeze(0)  # [1, num_tokens]
         return sequences
 
+    @torch.no_grad()
+    def generate_batched(
+        self,
+        input_embeds: torch.Tensor,  # [batch_size, 2, hidden]
+        forward_batch: ForwardBatch,
+        num_tokens: int,
+        do_sample: bool = True,
+        top_k: int = 50,
+        top_p: float = 0.8,
+    ) -> torch.Tensor:
+        """Generate num_tokens codes for a batch of requests.
+
+        Runs 1 batched prefill + (num_tokens-1) batched decode steps,
+        instead of batch_size × (1 prefill + num_tokens-1 decode).
+
+        Args:
+            input_embeds: [batch_size, 2, hidden] - stack of (hidden_states, codec_embed) per request
+            forward_batch: Forward batch info
+            num_tokens: Number of tokens to generate (15 for residual codes)
+            do_sample: Whether to sample (True) or greedy decode (False)
+            top_k: Top-k sampling parameter
+            top_p: Top-p (nucleus) sampling parameter
+
+        Returns:
+            Generated tokens [batch_size, num_tokens]
+        """
+        batch_size = input_embeds.shape[0]
+        device = input_embeds.device
+        generated_tokens = []
+        all_locs = []
+
+        # === Save original forward_batch state ===
+        original_seq_lens = forward_batch.seq_lens
+        original_seq_lens_cpu = forward_batch.seq_lens_cpu
+        original_seq_lens_sum = forward_batch.seq_lens_sum
+        original_req_pool_indices = forward_batch.req_pool_indices
+        original_out_cache_loc = forward_batch.out_cache_loc
+        original_forward_mode = forward_batch.forward_mode
+        original_extend_prefix_lens = forward_batch.extend_prefix_lens
+        original_extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+        original_extend_seq_lens = forward_batch.extend_seq_lens
+        original_extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        original_extend_num_tokens = forward_batch.extend_num_tokens
+        original_extend_start_loc = forward_batch.extend_start_loc
+        original_override_req_to_token = forward_batch.override_req_to_token
+        forward_batch.override_req_to_token = None  # Clear for code predictor
+
+        # Get memory pool references
+        allocator = forward_batch.token_to_kv_pool_allocator
+        req_to_token_pool = forward_batch.req_to_token_pool
+
+        # === Allocate batch_size request slots ===
+        predictor_req_slots = req_to_token_pool.alloc(batch_size)
+        if predictor_req_slots is None:
+            raise RuntimeError("Failed to allocate request slots for batched code predictor")
+        # Convert to tensor for attention backend (alloc returns a list)
+        predictor_req_indices = torch.tensor(predictor_req_slots, dtype=torch.int32, device=device)
+
+        # Clear stale KV locations for the slots we'll use
+        for i in range(batch_size):
+            req_to_token_pool.req_to_token[predictor_req_slots[i], :] = 0
+
+        # Set code predictor's req_pool_indices
+        forward_batch.req_pool_indices = predictor_req_indices
+
+        # === Prefill (batched) ===
+        prefill_len = 2  # Each request has 2 tokens: hidden_state embed + codec embed
+        total_prefill_tokens = batch_size * prefill_len
+
+        prefill_locs = allocator.alloc(total_prefill_tokens)
+        all_locs.append(prefill_locs)
+
+        # Write prefill locations to req_to_token mapping
+        for i in range(batch_size):
+            req_to_token_pool.req_to_token[predictor_req_slots[i], :prefill_len] = \
+                prefill_locs[i * prefill_len:(i + 1) * prefill_len]
+
+        # Set code predictor's state for extend mode
+        forward_batch.seq_lens = torch.full((batch_size,), prefill_len, dtype=torch.int32, device=device)
+        forward_batch.seq_lens_cpu = torch.full((batch_size,), prefill_len, dtype=torch.int32)
+        forward_batch.seq_lens_sum = total_prefill_tokens
+        forward_batch.out_cache_loc = prefill_locs
+        forward_batch.forward_mode = ForwardMode.EXTEND
+        forward_batch.extend_prefix_lens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        forward_batch.extend_prefix_lens_cpu = [0] * batch_size
+        forward_batch.extend_seq_lens = torch.full((batch_size,), prefill_len, dtype=torch.int32, device=device)
+        forward_batch.extend_seq_lens_cpu = [prefill_len] * batch_size
+        forward_batch.extend_num_tokens = total_prefill_tokens
+        forward_batch.extend_start_loc = torch.arange(0, total_prefill_tokens, prefill_len, dtype=torch.int32, device=device)
+
+        # Create positions for prefill: [0, 1] repeated for each request -> [batch_size * 2]
+        predictor_positions = torch.arange(0, prefill_len, dtype=torch.long, device=device).repeat(batch_size)
+
+        # Flatten input_embeds: [batch_size, 2, hidden] -> [batch_size * 2, hidden]
+        prefill_embeds = input_embeds.view(total_prefill_tokens, -1)
+
+        # Reinitialize attention metadata
+        forward_batch.attn_backend.init_forward_metadata(forward_batch)
+
+        # Run prefill - clone to prevent in-place modification
+        hidden_states = self.model(
+            input_ids=None,
+            positions=predictor_positions,
+            forward_batch=forward_batch,
+            input_embeds=prefill_embeds.clone(),
+        )  # [batch_size * 2, hidden]
+
+        # Get last token's hidden state per request: [batch_size, hidden]
+        hidden_states = hidden_states.view(batch_size, prefill_len, -1)[:, -1, :]
+        logits = self.lm_head[0](hidden_states)  # [batch_size, vocab]
+
+        # Sample first tokens
+        next_tokens = self._sample(logits, do_sample, top_k, top_p).squeeze(-1)  # [batch_size]
+        generated_tokens.append(next_tokens)
+
+        # === Decode loop (batched) ===
+        current_seq_len = prefill_len
+        for step in range(1, num_tokens):
+            # Get embedding for the tokens we just generated
+            embed_layer = self.model.embed_tokens[step - 1]
+            step_embeds = embed_layer(next_tokens)  # [batch_size, hidden]
+
+            current_seq_len += 1
+
+            # Allocate KV cache for this decode step
+            decode_locs = allocator.alloc(batch_size)
+            all_locs.append(decode_locs)
+
+            # Update req_to_token mapping with new token locations
+            for i in range(batch_size):
+                req_to_token_pool.req_to_token[predictor_req_slots[i], current_seq_len - 1] = decode_locs[i]
+
+            # Update forward_batch state for decode
+            forward_batch.seq_lens = torch.full((batch_size,), current_seq_len, dtype=torch.int32, device=device)
+            forward_batch.seq_lens_cpu = torch.full((batch_size,), current_seq_len, dtype=torch.int32)
+            forward_batch.seq_lens_sum = batch_size * current_seq_len
+            forward_batch.out_cache_loc = decode_locs
+            forward_batch.forward_mode = ForwardMode.DECODE
+
+            # Positions for decode: [current_seq_len - 1] for each request
+            predictor_positions = torch.full((batch_size,), current_seq_len - 1, dtype=torch.long, device=device)
+
+            # Reinitialize attention metadata
+            forward_batch.attn_backend.init_forward_metadata(forward_batch)
+
+            # Forward pass
+            hidden_states = self.model(
+                input_ids=None,
+                positions=predictor_positions,
+                forward_batch=forward_batch,
+                input_embeds=step_embeds,
+            )  # [batch_size, hidden]
+
+            # Use appropriate lm_head for this step
+            logits = self.lm_head[step](hidden_states)
+
+            # Sample next tokens
+            next_tokens = self._sample(logits, do_sample, top_k, top_p).squeeze(-1)
+            generated_tokens.append(next_tokens)
+
+        # === Cleanup ===
+        # Free code predictor's KV cache tokens
+        allocator.free(torch.cat(all_locs))
+        # Free request slots (use original tensor from alloc)
+        req_to_token_pool.free(predictor_req_slots)
+
+        # Restore original forward_batch state
+        forward_batch.seq_lens = original_seq_lens
+        forward_batch.seq_lens_cpu = original_seq_lens_cpu
+        forward_batch.seq_lens_sum = original_seq_lens_sum
+        forward_batch.req_pool_indices = original_req_pool_indices
+        forward_batch.out_cache_loc = original_out_cache_loc
+        forward_batch.forward_mode = original_forward_mode
+        forward_batch.extend_prefix_lens = original_extend_prefix_lens
+        forward_batch.extend_prefix_lens_cpu = original_extend_prefix_lens_cpu
+        forward_batch.extend_seq_lens = original_extend_seq_lens
+        forward_batch.extend_seq_lens_cpu = original_extend_seq_lens_cpu
+        forward_batch.extend_num_tokens = original_extend_num_tokens
+        forward_batch.extend_start_loc = original_extend_start_loc
+        forward_batch.override_req_to_token = original_override_req_to_token
+        # Reinitialize attention metadata for caller (uses override if set)
+        forward_batch.attn_backend.init_forward_metadata(forward_batch)
+
+        # Stack: list of [batch_size] -> [batch_size, num_tokens]
+        return torch.stack(generated_tokens, dim=1)
+
 
 class Qwen3OmniMoeTalkerForConditionalGeneration(nn.Module):
     """Top-level Talker module with projections, codec_head, model, and code_predictor."""
@@ -970,6 +1245,11 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(nn.Module):
         trailing_text_hidden: torch.Tensor = None,
         tts_pad_embed: torch.Tensor = None,
         codec_eos_token_id: int = 2150,
+        temperature: float = TALKER_TEMPERATURE_DEFAULT,
+        top_k: int = TALKER_TOP_K_DEFAULT,
+        top_p: float = TALKER_TOP_P_DEFAULT,
+        repetition_penalty: float = TALKER_REPETITION_PENALTY_DEFAULT,
+        prev_codec_tokens: Optional[List[int]] = None,
     ) -> Tuple[List[int], int]:
         """
         Args:
@@ -998,15 +1278,24 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(nn.Module):
             )
             # Get last position's hidden state and logits
             last_hidden = hidden_states[-1:]  # [1, hidden_dim]
+
             logits = self.codec_head(last_hidden)  # [1, vocab_size]
 
             # Sample codec token
-            codec_token = _sample_codec_token(logits.squeeze(0), codec_eos_token_id)
+            codec_token = _sample_codec_tokens(
+                logits.squeeze(0),
+                codec_eos_token_id,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                prev_tokens=prev_codec_tokens,
+            ).item()
 
             # Run code predictor: (current_hidden, embed(codec))
             codec_embed = self.model.embed_tokens(
                 torch.tensor([codec_token], device=device, dtype=torch.long)
-            )  # [1, hidden]
+            )
 
             predictor_input = torch.stack(
                 (last_hidden.squeeze(0), codec_embed.squeeze(0)), dim=0
@@ -1054,8 +1343,16 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(nn.Module):
         )
 
         # 4. Get logits and sample codec token
-        logits = self.codec_head(hidden_states)  # [1, vocab_size]
-        codec_token = _sample_codec_token(logits.squeeze(0), codec_eos_token_id)
+        logits = self.codec_head(hidden_states)
+        codec_token = _sample_codec_tokens(
+            logits.squeeze(0),
+            codec_eos_token_id,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            prev_tokens=prev_codec_tokens,
+        ).item()
 
         # 5. Run code predictor: (current_hidden, embed(codec))
         codec_embed = self.model.embed_tokens(
@@ -1682,13 +1979,472 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
             talker_needs_prefill=True,  # Signal to run talker prefill at first decode
         )
 
+    def _save_forward_batch_state(
+        self, forward_batch: ForwardBatch, save_extend: bool = False
+    ) -> dict:
+        """Save forward_batch state for later restoration after talker forward."""
+        batch_size = forward_batch.batch_size
+        req_to_token_pool = forward_batch.req_to_token_pool
+
+        saved_req_to_tokens = []
+        for i in range(batch_size):
+            req_idx = forward_batch.req_pool_indices[i].item()
+            seq_len = forward_batch.seq_lens[i].item()
+            saved_req_to_tokens.append(
+                req_to_token_pool.req_to_token[req_idx, :seq_len].clone()
+            )
+
+        state = {
+            "batch_size": batch_size,
+            "saved_req_to_tokens": saved_req_to_tokens,
+            "req_pool_indices": forward_batch.req_pool_indices.clone(),
+            "seq_lens": forward_batch.seq_lens,
+            "seq_lens_cpu": forward_batch.seq_lens_cpu,
+            "seq_lens_sum": forward_batch.seq_lens_sum,
+            "out_cache_loc": forward_batch.out_cache_loc,
+        }
+
+        if save_extend:
+            state.update({
+                "forward_mode": forward_batch.forward_mode,
+                "extend_prefix_lens_cpu": forward_batch.extend_prefix_lens_cpu,
+                "extend_seq_lens_cpu": forward_batch.extend_seq_lens_cpu,
+                "extend_prefix_lens": forward_batch.extend_prefix_lens,
+                "extend_seq_lens": forward_batch.extend_seq_lens,
+                "extend_num_tokens": forward_batch.extend_num_tokens,
+                "extend_start_loc": forward_batch.extend_start_loc,
+            })
+
+        return state
+
+    def _restore_forward_batch_state(
+        self, forward_batch: ForwardBatch, saved_state: dict
+    ) -> None:
+        """Restore forward_batch state after talker forward."""
+        req_to_token_pool = forward_batch.req_to_token_pool
+
+        forward_batch.batch_size = saved_state["batch_size"]
+        forward_batch.req_pool_indices = saved_state["req_pool_indices"]
+        batch_size = saved_state["batch_size"]
+
+        saved_req_to_tokens = saved_state["saved_req_to_tokens"]
+        for i in range(batch_size):
+            req_idx = saved_state["req_pool_indices"][i].item()
+            saved_tokens = saved_req_to_tokens[i]
+            req_to_token_pool.req_to_token[req_idx, : len(saved_tokens)] = saved_tokens
+
+        forward_batch.seq_lens = saved_state["seq_lens"]
+        forward_batch.seq_lens_cpu = saved_state["seq_lens_cpu"]
+        forward_batch.seq_lens_sum = saved_state["seq_lens_sum"]
+        forward_batch.out_cache_loc = saved_state["out_cache_loc"]
+
+        if "forward_mode" in saved_state:
+            forward_batch.forward_mode = saved_state["forward_mode"]
+            forward_batch.extend_prefix_lens_cpu = saved_state["extend_prefix_lens_cpu"]
+            forward_batch.extend_seq_lens_cpu = saved_state["extend_seq_lens_cpu"]
+            forward_batch.extend_prefix_lens = saved_state["extend_prefix_lens"]
+            forward_batch.extend_seq_lens = saved_state["extend_seq_lens"]
+            forward_batch.extend_num_tokens = saved_state["extend_num_tokens"]
+            forward_batch.extend_start_loc = saved_state["extend_start_loc"]
+
+        forward_batch.attn_backend.init_forward_metadata(forward_batch)
+
+    def _switch_to_talker_kv_cache_batched(
+        self, forward_batch: ForwardBatch, model_states: dict
+    ) -> List[torch.Tensor]:
+        """Switch forward_batch to talker KV caches for all requests.
+
+        Allocates new KV slots, updates req_to_token mappings, and sets seq_lens.
+
+        Returns:
+            updated_kv_locs_list: List of updated KV cache locations per request
+        """
+        batch_size = forward_batch.batch_size
+        device = forward_batch.seq_lens.device
+        allocator = forward_batch.token_to_kv_pool_allocator
+        req_to_token_pool = forward_batch.req_to_token_pool
+
+        talker_kv_locs_list = model_states.get("talker_kv_cache_locs_list", [])
+        new_seq_lens = []
+        new_out_cache_locs = []
+        updated_kv_locs_list = []
+
+        for i in range(batch_size):
+            req_idx = forward_batch.req_pool_indices[i].item()
+            talker_kv_locs = talker_kv_locs_list[i] if i < len(talker_kv_locs_list) else None
+
+            if talker_kv_locs is not None:
+                current_len = len(talker_kv_locs)
+
+                # Allocate new KV slot for this decode step
+                new_loc = allocator.alloc(1)
+                updated_locs = torch.cat([talker_kv_locs, new_loc])
+                new_len = current_len + 1
+
+                # Switch req_to_token to talker's KV cache
+                req_to_token_pool.req_to_token[req_idx, :new_len] = updated_locs
+
+                new_seq_lens.append(new_len)
+                new_out_cache_locs.append(new_loc)
+                updated_kv_locs_list.append(updated_locs)
+            else:
+                # No talker KV cache yet (shouldn't happen in decode)
+                new_seq_lens.append(1)
+                new_loc = allocator.alloc(1)
+                new_out_cache_locs.append(new_loc)
+                updated_kv_locs_list.append(new_loc)
+
+        # Update forward_batch with batched values
+        forward_batch.seq_lens = torch.tensor(new_seq_lens, dtype=torch.int32, device=device)
+        forward_batch.seq_lens_cpu = torch.tensor(new_seq_lens, dtype=torch.int32)
+        forward_batch.seq_lens_sum = sum(new_seq_lens)
+        forward_batch.out_cache_loc = torch.cat(new_out_cache_locs)
+
+        # Reinitialize attention metadata
+        forward_batch.attn_backend.init_forward_metadata(forward_batch)
+
+        return updated_kv_locs_list
+
+    def _run_talker_prefill_batched_subset(
+        self,
+        forward_batch: ForwardBatch,
+        model_states: dict,
+        request_indices: List[int],
+    ) -> Tuple[List[Optional[List[int]]], Optional[torch.Tensor], List[Optional[torch.Tensor]]]:
+        """Run batched talker prefill for a subset of requests."""
+        batch_size = forward_batch.batch_size
+        if not request_indices:
+            return [None] * batch_size, None, [None] * batch_size
+
+        device = forward_batch.seq_lens.device
+        prev_sampled_token = model_states.get("prev_sampled_thinker_token")
+        tts_pad_embed = model_states.get("tts_pad_embed")
+        codec_eos_token_id = model_states.get("codec_eos_token_id", 2150)
+        talker_temperature = model_states.get(
+            "talker_temperature", TALKER_TEMPERATURE_DEFAULT
+        )
+        talker_top_k = model_states.get("talker_top_k", TALKER_TOP_K_DEFAULT)
+        talker_top_p = model_states.get("talker_top_p", TALKER_TOP_P_DEFAULT)
+        talker_repetition_penalty = model_states.get(
+            "talker_repetition_penalty", TALKER_REPETITION_PENALTY_DEFAULT
+        )
+        talker_prev_codec_tokens = model_states.get("talker_prev_codec_tokens")
+        origin_input_ids = model_states.get("origin_input_ids")
+        if origin_input_ids is None:
+            return [None] * batch_size, None, [None] * batch_size
+
+        speakers = model_states.get("speakers")
+        allocator = forward_batch.token_to_kv_pool_allocator
+        vocab_size = self.thinker.model.embed_tokens.num_embeddings
+
+        talker_input_embeds_list = []
+        seq_lens = []
+        start_locs = []
+        last_indices = []
+        out_cache_loc_chunks = []
+        req_prev_tokens = []
+        tts_pad_embeds_out: List[Optional[torch.Tensor]] = [None] * batch_size
+        codec_frames: List[Optional[List[int]]] = [None] * batch_size
+        talker_out_cache_locs: List[Optional[torch.Tensor]] = [None] * batch_size
+
+        total_tokens = 0
+        for idx in request_indices:
+            full_input_ids = origin_input_ids[idx].clamp(min=0, max=vocab_size - 1)
+            first_token = prev_sampled_token[idx] if prev_sampled_token is not None else None
+            speaker = speakers[idx] if speakers else "ethan"
+            talker_input_embeds, tts_pad_embed_new = self._prepare_talker_prefill_1step(
+                thinker_embeds=self.thinker.model.embed_tokens(full_input_ids),
+                input_ids=full_input_ids,
+                first_response_token=first_token,
+                speaker=speaker,
+            )
+
+            seq_len = talker_input_embeds.shape[0]
+            start_locs.append(total_tokens)
+            last_indices.append(total_tokens + seq_len - 1)
+            total_tokens += seq_len
+
+            talker_input_embeds_list.append(talker_input_embeds)
+            seq_lens.append(seq_len)
+
+            kv_locs = allocator.alloc(seq_len)
+            talker_out_cache_locs[idx] = kv_locs
+            out_cache_loc_chunks.append(kv_locs)
+
+            if tts_pad_embed_new is not None:
+                tts_pad_embeds_out[idx] = tts_pad_embed_new
+
+            if talker_prev_codec_tokens is not None:
+                req_prev_tokens.append(talker_prev_codec_tokens[idx])
+            else:
+                req_prev_tokens.append(None)
+
+        saved_state = self._save_forward_batch_state(forward_batch, save_extend=True)
+
+        input_embeds = torch.cat(talker_input_embeds_list, dim=0)
+        positions = torch.cat(
+            [torch.arange(seq_len, device=device, dtype=torch.long) for seq_len in seq_lens],
+            dim=0,
+        )
+
+        extend_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        extend_prefix_lens = torch.zeros_like(extend_seq_lens)
+        extend_start_loc = torch.tensor(start_locs, dtype=torch.int32, device=device)
+
+        max_len = max(seq_lens)
+        talker_req_to_token = torch.zeros(
+            len(request_indices), max_len, dtype=torch.int32, device=device
+        )
+        for i, kv_locs in enumerate(out_cache_loc_chunks):
+            talker_req_to_token[i, : len(kv_locs)] = kv_locs
+
+        forward_batch.override_req_to_token = talker_req_to_token
+        forward_batch.batch_size = len(request_indices)
+        forward_batch.req_pool_indices = torch.arange(
+            len(request_indices), device=device, dtype=torch.int32
+        )
+        forward_batch.seq_lens = extend_seq_lens
+        forward_batch.seq_lens_cpu = extend_seq_lens.cpu()
+        forward_batch.seq_lens_sum = sum(seq_lens)
+        forward_batch.out_cache_loc = torch.cat(out_cache_loc_chunks)
+        forward_batch.forward_mode = ForwardMode.EXTEND
+        forward_batch.extend_prefix_lens = extend_prefix_lens
+        forward_batch.extend_prefix_lens_cpu = extend_prefix_lens.cpu().tolist()
+        forward_batch.extend_seq_lens = extend_seq_lens
+        forward_batch.extend_seq_lens_cpu = extend_seq_lens.cpu().tolist()
+        forward_batch.extend_start_loc = extend_start_loc
+        forward_batch.extend_num_tokens = total_tokens
+
+        forward_batch.attn_backend.init_forward_metadata(forward_batch)
+
+        hidden_states = self.talker.model(
+            input_ids=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+        )
+        last_hidden = hidden_states[torch.tensor(last_indices, device=device)]
+
+        if isinstance(talker_temperature, torch.Tensor):
+            temperature = talker_temperature[request_indices]
+        else:
+            temperature = talker_temperature
+        if isinstance(talker_top_k, torch.Tensor):
+            top_k = talker_top_k[request_indices]
+        else:
+            top_k = talker_top_k
+        if isinstance(talker_top_p, torch.Tensor):
+            top_p = talker_top_p[request_indices]
+        else:
+            top_p = talker_top_p
+        if isinstance(talker_repetition_penalty, torch.Tensor):
+            repetition_penalty = talker_repetition_penalty[request_indices]
+        else:
+            repetition_penalty = talker_repetition_penalty
+
+        logits = self.talker.codec_head(last_hidden)
+        codec_tokens = _sample_codec_tokens(
+            logits,
+            codec_eos_token_id,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            prev_tokens=req_prev_tokens,
+        )
+
+        codec_embeds = self.talker.model.embed_tokens(codec_tokens)
+        predictor_inputs = torch.stack([last_hidden, codec_embeds], dim=1)
+        residual_codes = self.talker.code_predictor.generate_batched(
+            input_embeds=predictor_inputs,
+            forward_batch=forward_batch,
+            num_tokens=self.talker.config.code_predictor_config.num_code_groups - 1,
+            do_sample=True,
+            top_k=50,
+            top_p=0.8,
+        )
+        codec_frames_tensor = torch.cat([codec_tokens.unsqueeze(1), residual_codes], dim=1)
+        codec_frames_list = codec_frames_tensor.tolist()
+        for local_i, req_idx in enumerate(request_indices):
+            codec_frames[req_idx] = codec_frames_list[local_i]
+
+        self._restore_forward_batch_state(forward_batch, saved_state)
+
+        tts_pad_embed_out = None
+        if any(e is not None for e in tts_pad_embeds_out):
+            if tts_pad_embed is not None:
+                for i, embed in enumerate(tts_pad_embeds_out):
+                    if embed is None:
+                        if tts_pad_embed.dim() == 2:
+                            tts_pad_embeds_out[i] = tts_pad_embed[i]
+                        else:
+                            tts_pad_embeds_out[i] = tts_pad_embed
+            if all(e is not None for e in tts_pad_embeds_out):
+                tts_pad_embed_out = torch.stack(tts_pad_embeds_out, dim=0)
+
+        return codec_frames, tts_pad_embed_out, talker_out_cache_locs
+
+    def _run_talker_decode_batched_subset(
+        self,
+        forward_batch: ForwardBatch,
+        model_states: dict,
+        request_indices: List[int],
+        positions: Optional[torch.Tensor] = None,
+    ) -> Tuple[List[Optional[List[int]]], List[Optional[torch.Tensor]]]:
+        """Run batched talker decode for a subset of requests."""
+        batch_size = forward_batch.batch_size
+        if not request_indices:
+            return [None] * batch_size, [None] * batch_size
+
+        device = forward_batch.seq_lens.device
+        index_tensor = torch.tensor(request_indices, device=device, dtype=torch.long)
+
+        prev_codec_ids = model_states.get("prev_codec_id")
+        prev_residual_codes = model_states.get("prev_residual_codes")
+        if prev_codec_ids is None or prev_residual_codes is None:
+            return [None] * batch_size, [None] * batch_size
+
+        prev_codec_ids = prev_codec_ids[index_tensor]
+        prev_residual_codes = prev_residual_codes[index_tensor]
+
+        talker_positions = model_states.get("talker_positions", positions)
+        if talker_positions is None:
+            return [None] * batch_size, [None] * batch_size
+        talker_positions = talker_positions[index_tensor]
+
+        codec_eos_token_id = model_states.get("codec_eos_token_id", 2150)
+        talker_temperature = model_states.get(
+            "talker_temperature", TALKER_TEMPERATURE_DEFAULT
+        )
+        talker_top_k = model_states.get("talker_top_k", TALKER_TOP_K_DEFAULT)
+        talker_top_p = model_states.get("talker_top_p", TALKER_TOP_P_DEFAULT)
+        talker_repetition_penalty = model_states.get(
+            "talker_repetition_penalty", TALKER_REPETITION_PENALTY_DEFAULT
+        )
+        talker_prev_codec_tokens = model_states.get("talker_prev_codec_tokens")
+        if talker_prev_codec_tokens is not None:
+            req_prev_tokens = [talker_prev_codec_tokens[i] for i in request_indices]
+        else:
+            req_prev_tokens = None
+
+        thinker_done_tensor = model_states.get("thinker_done")
+        if thinker_done_tensor is not None:
+            thinker_done_tensor = thinker_done_tensor[index_tensor]
+
+        tts_pad_embed = model_states.get("tts_pad_embed")
+        if tts_pad_embed is not None and tts_pad_embed.dim() == 2:
+            tts_pad_embed = tts_pad_embed[index_tensor]
+
+        prev_sampled_tokens = model_states.get("prev_sampled_thinker_token")
+        if prev_sampled_tokens is not None:
+            prev_sampled_tokens = prev_sampled_tokens[index_tensor]
+
+        codec_embed = self.talker.model.embed_tokens(prev_codec_ids)
+        residual_sum = torch.zeros_like(codec_embed)
+        for i in range(15):
+            embed_layer = self.talker.code_predictor.get_input_embeddings()[i]
+            residual_sum = residual_sum + embed_layer(prev_residual_codes[:, i])
+
+        input_embeds = codec_embed + residual_sum
+
+        trailing_text_hidden = None
+        if prev_sampled_tokens is not None:
+            prev_embeds = self.thinker.model.embed_tokens(prev_sampled_tokens)
+            trailing_text_hidden = self.talker.text_projection(prev_embeds)
+
+        if thinker_done_tensor is not None and thinker_done_tensor.any() and not thinker_done_tensor.all():
+            for i in range(len(request_indices)):
+                if thinker_done_tensor[i]:
+                    if tts_pad_embed is not None and tts_pad_embed.dim() == 2:
+                        input_embeds[i] = input_embeds[i] + tts_pad_embed[i]
+                else:
+                    if trailing_text_hidden is not None:
+                        input_embeds[i] = input_embeds[i] + trailing_text_hidden[i]
+        elif trailing_text_hidden is not None:
+            input_embeds = input_embeds + trailing_text_hidden
+
+        if isinstance(talker_temperature, torch.Tensor):
+            temperature = talker_temperature[index_tensor]
+        else:
+            temperature = talker_temperature
+        if isinstance(talker_top_k, torch.Tensor):
+            top_k = talker_top_k[index_tensor]
+        else:
+            top_k = talker_top_k
+        if isinstance(talker_top_p, torch.Tensor):
+            top_p = talker_top_p[index_tensor]
+        else:
+            top_p = talker_top_p
+        if isinstance(talker_repetition_penalty, torch.Tensor):
+            repetition_penalty = talker_repetition_penalty[index_tensor]
+        else:
+            repetition_penalty = talker_repetition_penalty
+
+        talker_kv_locs_list = model_states.get("talker_kv_cache_locs_list", [])
+        talker_kv_locs_subset = [
+            talker_kv_locs_list[i] if i < len(talker_kv_locs_list) else None
+            for i in request_indices
+        ]
+
+        saved_state = self._save_forward_batch_state(forward_batch)
+        forward_batch.batch_size = len(request_indices)
+        forward_batch.req_pool_indices = torch.arange(
+            len(request_indices), device=device, dtype=torch.int32
+        )
+        updated_kv_locs_list = self._switch_to_talker_kv_cache_batched(
+            forward_batch,
+            {"talker_kv_cache_locs_list": talker_kv_locs_subset},
+        )
+
+        hidden_states = self.talker.model(
+            input_ids=None,
+            positions=talker_positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+        )
+
+        logits = self.talker.codec_head(hidden_states)
+        codec_tokens = _sample_codec_tokens(
+            logits,
+            codec_eos_token_id,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            prev_tokens=req_prev_tokens,
+        )
+
+        codec_embeds = self.talker.model.embed_tokens(codec_tokens)
+        predictor_inputs = torch.stack([hidden_states, codec_embeds], dim=1)
+        residual_codes = self.talker.code_predictor.generate_batched(
+            input_embeds=predictor_inputs,
+            forward_batch=forward_batch,
+            num_tokens=self.talker.config.code_predictor_config.num_code_groups - 1,
+            do_sample=True,
+            top_k=50,
+            top_p=0.8,
+        )
+
+        codec_frames_tensor = torch.cat([codec_tokens.unsqueeze(1), residual_codes], dim=1)
+        codec_frames_list = codec_frames_tensor.tolist()
+
+        self._restore_forward_batch_state(forward_batch, saved_state)
+
+        codec_frames: List[Optional[List[int]]] = [None] * batch_size
+        updated_kv_locs: List[Optional[torch.Tensor]] = [None] * batch_size
+        for local_i, req_idx in enumerate(request_indices):
+            codec_frames[req_idx] = codec_frames_list[local_i]
+            updated_kv_locs[req_idx] = updated_kv_locs_list[local_i]
+
+        return codec_frames, updated_kv_locs
+
     def _forward_decode(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> ThinkerTalkerOutput:
-        """Decode both thinker and talker with 1-step delay.
+        """Decode both thinker and talker with 1-step delay. Supports batching.
 
         With 1-step delay design:
         - Talker runs 1 step behind thinker
@@ -1696,149 +2452,238 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         - At subsequent decodes: run talker decode using prev_sampled_thinker_token for look-ahead
         """
         model_states = forward_batch.model_specific_states or {}
+        batch_size = forward_batch.batch_size
+        device = forward_batch.seq_lens.device
 
-        # Check if thinker is done (would be set by scheduler after EOS)
+        # === 1. Check request states ===
         thinker_done_tensor = model_states.get("thinker_done")
-        thinker_done = thinker_done_tensor[0].item() if thinker_done_tensor is not None else False
+        talker_needs_prefill_tensor = model_states.get("talker_needs_prefill")
 
-        if thinker_done:
+        # Check if ALL requests have thinker done -> talker-only mode
+        if thinker_done_tensor is not None and thinker_done_tensor.all():
             return self._forward_talker_only(forward_batch)
 
-        # input_ids contains thinker token (sampled from previous step)
-        thinker_input_ids = input_ids
+        # Mixed batches are valid in SGLang, but the talker cannot run prefill for
+        # requests already decoding (it would overwrite their KV cache and corrupt audio).
+        if talker_needs_prefill_tensor is not None and talker_needs_prefill_tensor.any():
+            if talker_needs_prefill_tensor.all():
+                return self._run_talker_prefill_at_decode(
+                    thinker_logits=None,
+                    forward_batch=forward_batch,
+                    model_states=model_states,
+                )
+            return self._forward_decode_mixed_prefill_decode(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                model_states=model_states,
+                talker_needs_prefill_tensor=talker_needs_prefill_tensor,
+            )
 
-        # 1. Run thinker decode
+        # === 2. Run thinker decode on full batch ===
         thinker_result = self.thinker.model(
-            input_ids=thinker_input_ids,
+            input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
         )
 
-        # Unpack result
         if isinstance(thinker_result, tuple):
             thinker_hidden, aux_hidden_states = thinker_result
         else:
             thinker_hidden = thinker_result
 
-        # 2. Get thinker logits
         thinker_logits = self.thinker.logits_processor(
             input_ids, thinker_hidden, self.thinker.lm_head, forward_batch
         )
 
-        # 3. Check if talker needs prefill (1-step delay: talker prefill at first decode)
-        talker_needs_prefill_tensor = model_states.get("talker_needs_prefill")
-        talker_needs_prefill = (
-            talker_needs_prefill_tensor[0].item()
-            if talker_needs_prefill_tensor is not None
-            else False
-        )
-        if talker_needs_prefill:
-            # First decode: run talker prefill
-            return self._run_talker_prefill_at_decode(
-                thinker_logits=thinker_logits,
-                forward_batch=forward_batch,
-                model_states=model_states,
-            )
-
-        # 4. Regular decode: run talker with prev_sampled_thinker_token for look-ahead
-        prev_codec_id = model_states.get("prev_codec_id")
-        prev_residual_codes = model_states.get("prev_residual_codes")
-        tts_pad_embed = model_states.get("tts_pad_embed")
-        talker_positions = model_states.get("talker_positions", positions)
-        prev_sampled_token = model_states.get("prev_sampled_thinker_token")
+        # === 3. Get batched talker state ===
+        prev_codec_ids = model_states.get("prev_codec_id")  # [batch_size]
+        prev_residual_codes = model_states.get("prev_residual_codes")  # [batch_size, 15]
+        tts_pad_embed = model_states.get("tts_pad_embed")  # [batch_size, hidden] or None
+        talker_positions = model_states.get("talker_positions", positions)  # [batch_size]
+        prev_sampled_tokens = model_states.get("prev_sampled_thinker_token")  # [batch_size]
         codec_eos_token_id = model_states.get("codec_eos_token_id", 2150)
+        talker_temperature = model_states.get(
+            "talker_temperature", TALKER_TEMPERATURE_DEFAULT
+        )
+        talker_top_k = model_states.get("talker_top_k", TALKER_TOP_K_DEFAULT)
+        talker_top_p = model_states.get("talker_top_p", TALKER_TOP_P_DEFAULT)
+        talker_repetition_penalty = model_states.get(
+            "talker_repetition_penalty", TALKER_REPETITION_PENALTY_DEFAULT
+        )
+        talker_prev_codec_tokens = model_states.get("talker_prev_codec_tokens")
 
-        if prev_codec_id is None or prev_residual_codes is None:
+        if prev_codec_ids is None or prev_residual_codes is None:
             # No previous codec frame yet - shouldn't happen after prefill
             return ThinkerTalkerOutput(thinker_logits=thinker_logits)
 
-        # Compute look-ahead text embedding from prev_sampled_thinker_token
-        # This is the token sampled at previous thinker step (token N for talker step N-1)
-        if prev_sampled_token is not None:
-            prev_embed = self.thinker.model.embed_tokens(prev_sampled_token)
-            trailing_text_hidden = self.talker.text_projection(prev_embed)
+        # === 4. Build batched talker input_embeds: [batch_size, hidden] ===
+        # Embed prev_codec_ids: [batch_size, hidden]
+        codec_embed = self.talker.model.embed_tokens(prev_codec_ids)
+
+        # Embed prev_residual_codes and sum: [batch_size, hidden]
+        residual_sum = torch.zeros_like(codec_embed)
+        for i in range(15):
+            embed_layer = self.talker.code_predictor.get_input_embeddings()[i]
+            residual_sum = residual_sum + embed_layer(prev_residual_codes[:, i])
+
+        # Compute trailing_text_hidden: [batch_size, hidden]
+        # For requests with thinker_done, use tts_pad_embed instead of trailing_text_hidden
+        if prev_sampled_tokens is not None:
+            prev_embeds = self.thinker.model.embed_tokens(prev_sampled_tokens)
+            trailing_text_hidden = self.talker.text_projection(prev_embeds)
         else:
             trailing_text_hidden = None
 
-        # === Switch forward_batch to talker's KV cache state ===
-        allocator = forward_batch.token_to_kv_pool_allocator
-        req_to_token_pool = forward_batch.req_to_token_pool
-        device = forward_batch.seq_lens.device
+        # Combine: [batch_size, hidden]
+        input_embeds = codec_embed + residual_sum
 
-        # Save thinker's forward_batch state
-        thinker_req_idx = forward_batch.req_pool_indices[0].item()
-        thinker_seq_len = forward_batch.seq_lens[0].item()
-        thinker_req_to_token = req_to_token_pool.req_to_token[thinker_req_idx, :thinker_seq_len].clone()
-        thinker_out_cache_loc = forward_batch.out_cache_loc
-        thinker_seq_lens = forward_batch.seq_lens
-        thinker_seq_lens_cpu = forward_batch.seq_lens_cpu
-        thinker_seq_lens_sum = forward_batch.seq_lens_sum
+        # Handle mixed thinker_done states: use tts_pad_embed for done requests
+        if thinker_done_tensor is not None and thinker_done_tensor.any() and not thinker_done_tensor.all():
+            # Mixed case: some done, some not
+            for i in range(batch_size):
+                if thinker_done_tensor[i]:
+                    # Use tts_pad_embed for this request
+                    if tts_pad_embed is not None and tts_pad_embed.dim() == 2:
+                        input_embeds[i] = input_embeds[i] + tts_pad_embed[i]
+                else:
+                    # Use trailing_text_hidden for this request
+                    if trailing_text_hidden is not None:
+                        input_embeds[i] = input_embeds[i] + trailing_text_hidden[i]
+        elif trailing_text_hidden is not None:
+            # All requests use trailing_text_hidden (none done)
+            input_embeds = input_embeds + trailing_text_hidden
 
-        # Get talker's existing KV cache locations
-        talker_kv_locs = model_states.get("talker_kv_cache_locs")
-        updated_kv_locs_for_return = None
+        # === 5. Switch forward_batch to talker KV cache (batched) ===
+        saved_state = self._save_forward_batch_state(forward_batch)
+        updated_kv_locs_list = self._switch_to_talker_kv_cache_batched(forward_batch, model_states)
 
-        if talker_kv_locs is not None:
-            talker_current_len = len(talker_kv_locs)
-
-            # Allocate new KV token for this decode step
-            new_talker_loc = allocator.alloc(1)
-
-            # Update talker's KV cache locations (append new token)
-            updated_talker_kv_locs = torch.cat([talker_kv_locs, new_talker_loc])
-            new_talker_seq_len = talker_current_len + 1
-
-            # Switch req_to_token to talker's KV cache
-            req_to_token_pool.req_to_token[thinker_req_idx, :new_talker_seq_len] = updated_talker_kv_locs
-
-            # Update forward_batch for talker
-            forward_batch.out_cache_loc = new_talker_loc
-            forward_batch.seq_lens = torch.tensor([new_talker_seq_len], dtype=torch.int32, device=device)
-            forward_batch.seq_lens_cpu = torch.tensor([new_talker_seq_len], dtype=torch.int32)
-            forward_batch.seq_lens_sum = new_talker_seq_len
-
-            # Reinitialize attention metadata for talker's KV cache layout
-            forward_batch.attn_backend.init_forward_metadata(forward_batch)
-
-            updated_kv_locs_for_return = updated_talker_kv_locs
-
-        # Convert prev_codec_id tensor to int if needed
-        if isinstance(prev_codec_id, torch.Tensor):
-            prev_codec_id = prev_codec_id.item()
-
-        # Run talker decode (talker runs FIRST, then samples codec, then code predictor)
-        codec_frame, codec_token = self.talker.forward(
+        # === 6. Run talker.model ONCE for all requests ===
+        hidden_states = self.talker.model(
+            input_ids=None,
             positions=talker_positions,
             forward_batch=forward_batch,
-            prev_codec_id=prev_codec_id,
-            prev_residual_codes=prev_residual_codes,
-            trailing_text_hidden=trailing_text_hidden,
-            tts_pad_embed=tts_pad_embed,
-            codec_eos_token_id=codec_eos_token_id,
+            input_embeds=input_embeds,
+        )  # [batch_size, hidden]
+
+        # === 7. Sample codec tokens (batched) ===
+        logits = self.talker.codec_head(hidden_states)  # [batch_size, vocab]
+        codec_tokens = _sample_codec_tokens(
+            logits,
+            codec_eos_token_id,
+            temperature=talker_temperature,
+            top_k=talker_top_k,
+            top_p=talker_top_p,
+            repetition_penalty=talker_repetition_penalty,
+            prev_tokens=talker_prev_codec_tokens,
         )
 
-        # === Restore thinker's forward_batch state ===
-        if talker_kv_locs is not None:
-            req_to_token_pool.req_to_token[thinker_req_idx, :thinker_seq_len] = thinker_req_to_token
-            forward_batch.out_cache_loc = thinker_out_cache_loc
-            forward_batch.seq_lens = thinker_seq_lens
-            forward_batch.seq_lens_cpu = thinker_seq_lens_cpu
-            forward_batch.seq_lens_sum = thinker_seq_lens_sum
-            forward_batch.attn_backend.init_forward_metadata(forward_batch)
+        # === 8. Run code predictor (batched) ===
+        codec_embeds = self.talker.model.embed_tokens(codec_tokens)  # [batch_size, hidden]
+        predictor_inputs = torch.stack([hidden_states, codec_embeds], dim=1)  # [batch_size, 2, hidden]
+        residual_codes = self.talker.code_predictor.generate_batched(
+            input_embeds=predictor_inputs,
+            forward_batch=forward_batch,
+            num_tokens=self.talker.config.code_predictor_config.num_code_groups - 1,
+            do_sample=True,
+            top_k=50,
+            top_p=0.8,
+        )  # [batch_size, 15]
+
+        # Build codec_frames list for compatibility
+        codec_frames_tensor = torch.cat([codec_tokens.unsqueeze(1), residual_codes], dim=1)  # [batch_size, 16]
+        codec_frames = codec_frames_tensor.tolist()
+
+        # === 9. Restore forward_batch state ===
+        self._restore_forward_batch_state(forward_batch, saved_state)
 
         return ThinkerTalkerOutput(
             thinker_logits=thinker_logits,
-            codec_frame=codec_frame,
-            updated_talker_kv_locs=updated_kv_locs_for_return,
+            codec_frames=codec_frames,
+            updated_talker_kv_locs_list=updated_kv_locs_list,
+        )
+
+    def _forward_decode_mixed_prefill_decode(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        model_states: dict,
+        talker_needs_prefill_tensor: torch.Tensor,
+    ) -> ThinkerTalkerOutput:
+        """Handle mixed batches where some requests need talker prefill and others decode."""
+        batch_size = forward_batch.batch_size
+        needs_prefill = talker_needs_prefill_tensor.tolist()
+        prefill_indices = [i for i, flag in enumerate(needs_prefill) if flag]
+        decode_indices = [i for i, flag in enumerate(needs_prefill) if not flag]
+
+        # Run thinker decode on full batch
+        thinker_result = self.thinker.model(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+        )
+        if isinstance(thinker_result, tuple):
+            thinker_hidden, _ = thinker_result
+        else:
+            thinker_hidden = thinker_result
+
+        thinker_logits = self.thinker.logits_processor(
+            input_ids, thinker_hidden, self.thinker.lm_head, forward_batch
+        )
+
+        codec_frames: List[Optional[List[int]]] = [None] * batch_size
+        talker_out_cache_locs: List[Optional[torch.Tensor]] = [None] * batch_size
+        updated_kv_locs_list: List[Optional[torch.Tensor]] = [None] * batch_size
+        tts_pad_embed_out = None
+
+        # Run talker prefill for requests that need it
+        if prefill_indices:
+            prefill_frames, tts_pad_embed_out, talker_out_cache_locs = (
+                self._run_talker_prefill_batched_subset(
+                    forward_batch=forward_batch,
+                    model_states=model_states,
+                    request_indices=prefill_indices,
+                )
+            )
+            codec_frames = prefill_frames
+
+        # Run talker decode for requests already in decode stage
+        if decode_indices:
+            decode_frames, updated_kv_locs_list = self._run_talker_decode_batched_subset(
+                forward_batch=forward_batch,
+                model_states=model_states,
+                request_indices=decode_indices,
+                positions=positions,
+            )
+            for i, frame in enumerate(decode_frames):
+                if frame is not None:
+                    codec_frames[i] = frame
+
+        return ThinkerTalkerOutput(
+            thinker_logits=thinker_logits,
+            codec_frames=codec_frames,
+            tts_pad_embed=tts_pad_embed_out,
+            talker_out_cache_loc_list=(
+                talker_out_cache_locs
+                if any(kv_locs is not None for kv_locs in talker_out_cache_locs)
+                else None
+            ),
+            updated_talker_kv_locs_list=(
+                updated_kv_locs_list
+                if any(kv_locs is not None for kv_locs in updated_kv_locs_list)
+                else None
+            ),
         )
 
     def _run_talker_prefill_at_decode(
         self,
-        thinker_logits: LogitsProcessorOutput,
+        thinker_logits: Optional[LogitsProcessorOutput],
         forward_batch: ForwardBatch,
         model_states: dict,
+        request_indices: Optional[List[int]] = None,
     ) -> ThinkerTalkerOutput:
-        """Run talker prefill at first decode step (1-step delay).
+        """Run talker prefill at first decode step (1-step delay). Supports batching.
 
         Uses prev_sampled_thinker_token (token 0) as first response token,
         and current thinker input_ids (token 1) as look-ahead.
@@ -1846,194 +2691,137 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         With new design: talker prefill samples codec and runs code predictor,
         returning complete first frame.
         """
-        device = forward_batch.seq_lens.device
-        prev_sampled_token = model_states.get("prev_sampled_thinker_token")
-        tts_pad_embed = model_states.get("tts_pad_embed")
-        codec_eos_token_id = model_states.get("codec_eos_token_id", 2150)
+        batch_size = forward_batch.batch_size
 
-        # Get full input_ids for ChatML parsing
-        origin_input_ids = model_states.get("origin_input_ids")
-        if origin_input_ids is None:
-            # Fallback: return without talker
-            return ThinkerTalkerOutput(thinker_logits=thinker_logits)
+        # First run thinker decode if thinker_logits not provided
+        if thinker_logits is None:
+            thinker_result = self.thinker.model(
+                input_ids=forward_batch.input_ids,
+                positions=forward_batch.positions,
+                forward_batch=forward_batch,
+            )
+            if isinstance(thinker_result, tuple):
+                thinker_hidden, _ = thinker_result
+            else:
+                thinker_hidden = thinker_result
 
-        full_input_ids = origin_input_ids[0]
-        vocab_size = self.thinker.model.embed_tokens.num_embeddings
-        full_input_ids = full_input_ids.clamp(min=0, max=vocab_size - 1)
-
-        # Compute thinker_embeds for building talker input
-        thinker_embeds = self.thinker.model.embed_tokens(full_input_ids)
-
-        # Build talker prefill input with prev_sampled_token as first response
-        talker_input_embeds, tts_pad_embed_new = self._prepare_talker_prefill_1step(
-            thinker_embeds=thinker_embeds,
-            input_ids=full_input_ids,
-            first_response_token=prev_sampled_token[0] if prev_sampled_token is not None else None,
+            thinker_logits = self.thinker.logits_processor(
+                forward_batch.input_ids, thinker_hidden, self.thinker.lm_head, forward_batch
+            )
+        indices = request_indices if request_indices is not None else list(range(batch_size))
+        codec_frames, tts_pad_embed_out, talker_out_cache_locs = (
+            self._run_talker_prefill_batched_subset(
+                forward_batch=forward_batch,
+                model_states=model_states,
+                request_indices=indices,
+            )
         )
-
-        # Use new tts_pad_embed if computed, otherwise use stored
-        if tts_pad_embed_new is not None:
-            tts_pad_embed = tts_pad_embed_new
-
-        # Build positions for talker prefill
-        talker_seq_len = talker_input_embeds.shape[0]
-        talker_positions = torch.arange(talker_seq_len, device=device, dtype=torch.long)
-
-        # === Allocate KV cache for talker prefill ===
-        allocator = forward_batch.token_to_kv_pool_allocator
-        req_to_token_pool = forward_batch.req_to_token_pool
-
-        # Save thinker's state
-        thinker_req_idx = forward_batch.req_pool_indices[0].item()
-        thinker_seq_len_val = forward_batch.seq_lens[0].item()
-        thinker_req_to_token = req_to_token_pool.req_to_token[thinker_req_idx, :thinker_seq_len_val].clone()
-        thinker_out_cache_loc = forward_batch.out_cache_loc
-        thinker_seq_lens = forward_batch.seq_lens
-        thinker_seq_lens_cpu = forward_batch.seq_lens_cpu
-        thinker_seq_lens_sum = forward_batch.seq_lens_sum
-        thinker_extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
-        thinker_extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-        thinker_extend_prefix_lens = forward_batch.extend_prefix_lens
-        thinker_extend_seq_lens = forward_batch.extend_seq_lens
-        thinker_extend_num_tokens = forward_batch.extend_num_tokens
-        thinker_extend_start_loc = forward_batch.extend_start_loc
-
-        # Allocate KV cache for talker prefill
-        talker_out_cache_loc = allocator.alloc(talker_seq_len)
-        req_to_token_pool.req_to_token[thinker_req_idx, :talker_seq_len] = talker_out_cache_loc
-
-        # Set talker's forward_batch state
-        forward_batch.out_cache_loc = talker_out_cache_loc
-        forward_batch.seq_lens = torch.tensor([talker_seq_len], device=device, dtype=torch.int32)
-        forward_batch.seq_lens_cpu = [talker_seq_len]
-        forward_batch.seq_lens_sum = talker_seq_len
-        forward_batch.extend_prefix_lens_cpu = [0]
-        forward_batch.extend_seq_lens_cpu = [talker_seq_len]
-        forward_batch.extend_prefix_lens = torch.tensor([0], device=device, dtype=torch.int32)
-        forward_batch.extend_seq_lens = torch.tensor([talker_seq_len], device=device, dtype=torch.int32)
-        forward_batch.extend_num_tokens = talker_seq_len
-        forward_batch.extend_start_loc = torch.tensor([0], device=device, dtype=torch.int32)
-        forward_batch.forward_mode = ForwardMode.EXTEND
-
-        forward_batch.attn_backend.init_forward_metadata(forward_batch)
-
-        # Run talker prefill - now samples codec and runs code predictor internally
-        codec_frame, codec_token = self.talker.forward(
-            positions=talker_positions,
-            forward_batch=forward_batch,
-            input_embeds=talker_input_embeds,
-            codec_eos_token_id=codec_eos_token_id,
-        )
-
-        # Restore thinker's state
-        forward_batch.out_cache_loc = thinker_out_cache_loc
-        forward_batch.seq_lens = thinker_seq_lens
-        forward_batch.seq_lens_cpu = thinker_seq_lens_cpu
-        forward_batch.seq_lens_sum = thinker_seq_lens_sum
-        forward_batch.extend_prefix_lens_cpu = thinker_extend_prefix_lens_cpu
-        forward_batch.extend_seq_lens_cpu = thinker_extend_seq_lens_cpu
-        forward_batch.extend_prefix_lens = thinker_extend_prefix_lens
-        forward_batch.extend_seq_lens = thinker_extend_seq_lens
-        forward_batch.extend_num_tokens = thinker_extend_num_tokens
-        forward_batch.extend_start_loc = thinker_extend_start_loc
-        forward_batch.forward_mode = ForwardMode.DECODE
-        req_to_token_pool.req_to_token[thinker_req_idx, :thinker_seq_len_val] = thinker_req_to_token
-        forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
         return ThinkerTalkerOutput(
             thinker_logits=thinker_logits,
-            codec_frame=codec_frame,
-            tts_pad_embed=tts_pad_embed,
-            talker_out_cache_loc=talker_out_cache_loc,
+            codec_frames=codec_frames,
+            tts_pad_embed=tts_pad_embed_out,
+            talker_out_cache_loc_list=(
+                talker_out_cache_locs
+                if any(kv_locs is not None for kv_locs in talker_out_cache_locs)
+                else None
+            ),
         )
 
     def _forward_talker_only(
         self,
         forward_batch: ForwardBatch,
     ) -> ThinkerTalkerOutput:
-        """Continue talker generation after thinker has finished (hit EOS)."""
-        model_states = forward_batch.model_specific_states or {}
-        prev_codec_id = model_states.get("prev_codec_id")
-        prev_residual_codes = model_states.get("prev_residual_codes")
-        tts_pad_embed = model_states.get("tts_pad_embed")
-        talker_positions = model_states.get("talker_positions")
-        codec_eos_token_id = model_states.get("codec_eos_token_id", 2150)
+        """Continue talker generation after thinker has finished (hit EOS). Supports batching.
 
-        # === Switch forward_batch to talker's KV cache state ===
-        allocator = forward_batch.token_to_kv_pool_allocator
-        req_to_token_pool = forward_batch.req_to_token_pool
+        When thinker is done, talker continues to generate audio using tts_pad_embed
+        instead of trailing_text_hidden. This uses the batched helper functions.
+        """
+        model_states = forward_batch.model_specific_states or {}
+        batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
-        # Save thinker's forward_batch state
-        thinker_req_idx = forward_batch.req_pool_indices[0].item()
-        thinker_seq_len = forward_batch.seq_lens[0].item()
-        thinker_req_to_token = req_to_token_pool.req_to_token[thinker_req_idx, :thinker_seq_len].clone()
-        thinker_out_cache_loc = forward_batch.out_cache_loc
-        thinker_seq_lens = forward_batch.seq_lens
-        thinker_seq_lens_cpu = forward_batch.seq_lens_cpu
-        thinker_seq_lens_sum = forward_batch.seq_lens_sum
+        # Get batched state
+        prev_codec_ids = model_states.get("prev_codec_id")  # [batch_size]
+        prev_residual_codes = model_states.get("prev_residual_codes")  # [batch_size, 15]
+        tts_pad_embed = model_states.get("tts_pad_embed")  # [batch_size, hidden]
+        talker_positions = model_states.get("talker_positions")  # [batch_size]
+        codec_eos_token_id = model_states.get("codec_eos_token_id", 2150)
+        talker_temperature = model_states.get(
+            "talker_temperature", TALKER_TEMPERATURE_DEFAULT
+        )
+        talker_top_k = model_states.get("talker_top_k", TALKER_TOP_K_DEFAULT)
+        talker_top_p = model_states.get("talker_top_p", TALKER_TOP_P_DEFAULT)
+        talker_repetition_penalty = model_states.get(
+            "talker_repetition_penalty", TALKER_REPETITION_PENALTY_DEFAULT
+        )
+        talker_prev_codec_tokens = model_states.get("talker_prev_codec_tokens")
 
-        # Get talker's existing KV cache locations
-        talker_kv_locs = model_states.get("talker_kv_cache_locs")
-        updated_kv_locs_for_return = None
-        if talker_kv_locs is not None:
-            talker_current_len = len(talker_kv_locs)
+        if prev_codec_ids is None or prev_residual_codes is None:
+            return ThinkerTalkerOutput(thinker_logits=None)
 
-            # Allocate new KV token for this decode step
-            new_talker_loc = allocator.alloc(1)
+        # === 1. Build batched talker input_embeds: [batch_size, hidden] ===
+        # Embed prev_codec_ids: [batch_size, hidden]
+        codec_embed = self.talker.model.embed_tokens(prev_codec_ids)
 
-            # Update talker's KV cache locations (append new token)
-            updated_talker_kv_locs = torch.cat([talker_kv_locs, new_talker_loc])
-            new_talker_seq_len = talker_current_len + 1
+        # Embed prev_residual_codes and sum: [batch_size, hidden]
+        residual_sum = torch.zeros_like(codec_embed)
+        for i in range(15):
+            embed_layer = self.talker.code_predictor.get_input_embeddings()[i]
+            residual_sum = residual_sum + embed_layer(prev_residual_codes[:, i])
 
-            # Switch req_to_token to talker's KV cache
-            req_to_token_pool.req_to_token[thinker_req_idx, :new_talker_seq_len] = updated_talker_kv_locs
+        # Use tts_pad_embed instead of trailing_text_hidden (thinker is done)
+        input_embeds = codec_embed + residual_sum
+        if tts_pad_embed is not None:
+            input_embeds = input_embeds + tts_pad_embed
 
-            # Update forward_batch for talker
-            forward_batch.out_cache_loc = new_talker_loc
-            forward_batch.seq_lens = torch.tensor([new_talker_seq_len], dtype=torch.int32, device=device)
-            forward_batch.seq_lens_cpu = torch.tensor([new_talker_seq_len], dtype=torch.int32)
-            forward_batch.seq_lens_sum = new_talker_seq_len
+        # === 2. Switch forward_batch to talker KV cache (batched) ===
+        saved_state = self._save_forward_batch_state(forward_batch)
+        updated_kv_locs_list = self._switch_to_talker_kv_cache_batched(forward_batch, model_states)
 
-            # Reinitialize attention metadata for talker's KV cache layout
-            forward_batch.attn_backend.init_forward_metadata(forward_batch)
-
-        # Convert prev_codec_id tensor to int if needed
-        if isinstance(prev_codec_id, torch.Tensor):
-            prev_codec_id = prev_codec_id.item()
-
-        # Run talker with tts_pad_embed instead of text hidden (thinker is done)
-        codec_frame, codec_token = self.talker.forward(
+        # === 3. Run talker.model ONCE for all requests ===
+        hidden_states = self.talker.model(
+            input_ids=None,
             positions=talker_positions,
             forward_batch=forward_batch,
-            prev_codec_id=prev_codec_id,
-            prev_residual_codes=prev_residual_codes,
-            trailing_text_hidden=None,  # No more text hidden from thinker
-            tts_pad_embed=tts_pad_embed,  # Use padding embed
-            codec_eos_token_id=codec_eos_token_id,
+            input_embeds=input_embeds,
+        )  # [batch_size, hidden]
+
+        # === 4. Sample codec tokens (batched) ===
+        logits = self.talker.codec_head(hidden_states)  # [batch_size, vocab]
+        codec_tokens = _sample_codec_tokens(
+            logits,
+            codec_eos_token_id,
+            temperature=talker_temperature,
+            top_k=talker_top_k,
+            top_p=talker_top_p,
+            repetition_penalty=talker_repetition_penalty,
+            prev_tokens=talker_prev_codec_tokens,
         )
 
-        # === Restore thinker's forward_batch state ===
-        if talker_kv_locs is not None:
-            # Restore thinker's req_to_token entries
-            req_to_token_pool.req_to_token[thinker_req_idx, :thinker_seq_len] = thinker_req_to_token
+        # === 5. Run code predictor (batched) ===
+        codec_embeds = self.talker.model.embed_tokens(codec_tokens)  # [batch_size, hidden]
+        predictor_inputs = torch.stack([hidden_states, codec_embeds], dim=1)  # [batch_size, 2, hidden]
+        residual_codes = self.talker.code_predictor.generate_batched(
+            input_embeds=predictor_inputs,
+            forward_batch=forward_batch,
+            num_tokens=self.talker.config.code_predictor_config.num_code_groups - 1,
+            do_sample=True,
+            top_k=50,
+            top_p=0.8,
+        )  # [batch_size, 15]
 
-            # Restore forward_batch state
-            forward_batch.out_cache_loc = thinker_out_cache_loc
-            forward_batch.seq_lens = thinker_seq_lens
-            forward_batch.seq_lens_cpu = thinker_seq_lens_cpu
-            forward_batch.seq_lens_sum = thinker_seq_lens_sum
+        # Build codec_frames list for compatibility
+        codec_frames_tensor = torch.cat([codec_tokens.unsqueeze(1), residual_codes], dim=1)  # [batch_size, 16]
+        codec_frames = codec_frames_tensor.tolist()
 
-            # Reinitialize attention metadata for thinker
-            forward_batch.attn_backend.init_forward_metadata(forward_batch)
-
-            # Store updated talker KV locations for return to scheduler
-            updated_kv_locs_for_return = updated_talker_kv_locs
+        # === 6. Restore forward_batch state ===
+        self._restore_forward_batch_state(forward_batch, saved_state)
 
         return ThinkerTalkerOutput(
             thinker_logits=None,  # Thinker is done
-            codec_frame=codec_frame,
-            updated_talker_kv_locs=updated_kv_locs_for_return,
+            codec_frames=codec_frames,
+            updated_talker_kv_locs_list=updated_kv_locs_list,
         )
 
     def _prepare_talker_prefill_1step(

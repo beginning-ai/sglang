@@ -118,7 +118,6 @@ class ModelRunnerKVCacheMixin:
                         * num_layers
                         * kv_size
                     )
-
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16

@@ -663,9 +663,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         prev_sampled_thinker_token = []
         tts_pad_embed = []
         codec_eos_token_id = None
+        talker_temperatures = []
+        talker_top_ks = []
+        talker_top_ps = []
+        talker_repetition_penalties = []
+        talker_prev_codec_tokens = []
 
         for req in reqs:
             thinker_done.append(req.thinker_done)
+            custom_params = req.sampling_params.custom_params
+            if not isinstance(custom_params, dict):
+                custom_params = {}
+
             talker_step.append(req.talker_step)
             talker_needs_prefill.append(req.talker_needs_prefill)
 
@@ -678,11 +687,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Previous codec token and residual codes for talker input
             if req.talker_codec_ids:
                 prev_codec_id.append(req.talker_codec_ids[-1])
+                if req.prev_residual_codes is not None:
+                    prev_residual_codes.append(req.prev_residual_codes)
             else:
                 prev_codec_id.append(0)  # Placeholder, won't be used
-
-            if req.prev_residual_codes is not None:
-                prev_residual_codes.append(req.prev_residual_codes)
 
             if req.tts_pad_embed is not None:
                 tts_pad_embed.append(req.tts_pad_embed)
@@ -690,6 +698,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Get codec_eos_token_id from first request that has it
             if codec_eos_token_id is None and req.codec_eos_token_id is not None:
                 codec_eos_token_id = req.codec_eos_token_id
+
+            talker_temperatures.append(custom_params.get("talker_temperature", 0.9))
+            talker_top_ks.append(custom_params.get("talker_top_k", 50))
+            talker_top_ps.append(custom_params.get("talker_top_p", 1.0))
+            talker_repetition_penalties.append(
+                custom_params.get("talker_repetition_penalty", 1.05)
+            )
+
+            talker_prev_codec_tokens.append(
+                list(req.talker_codec_ids) if req.talker_codec_ids else []
+            )
 
         # Compute talker positions: prefill_len + talker_step for each request
         # This ensures decode positions continue from where prefill left off
@@ -712,6 +731,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             "prev_sampled_thinker_token": torch.tensor(
                 prev_sampled_thinker_token, dtype=torch.long, device=device
             ),
+            "talker_temperature": torch.tensor(
+                talker_temperatures, dtype=torch.float, device=device
+            ),
+            "talker_top_k": torch.tensor(
+                talker_top_ks, dtype=torch.int32, device=device
+            ),
+            "talker_top_p": torch.tensor(
+                talker_top_ps, dtype=torch.float, device=device
+            ),
+            "talker_repetition_penalty": torch.tensor(
+                talker_repetition_penalties, dtype=torch.float, device=device
+            ),
+            "talker_prev_codec_tokens": talker_prev_codec_tokens,
         }
 
         # Add codec_eos_token_id if available
@@ -724,15 +756,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 tts_pad_embed, dim=0
             )
 
-        # Store prev_residual_codes if available (for talker decode input)
-        # Only first request's codes are used (batch_size=1 assumption for now)
-        if prev_residual_codes and len(prev_residual_codes) >= 1:
-            self.model_specific_states["prev_residual_codes"] = prev_residual_codes[0]
+        # Store prev_residual_codes as [batch_size, 15] tensor for batched talker decode
+        if prev_residual_codes and len(prev_residual_codes) == batch_size:
+            self.model_specific_states["prev_residual_codes"] = torch.tensor(
+                prev_residual_codes, dtype=torch.long, device=device
+            )  # [batch_size, 15]
 
-        # Store talker KV cache locations for switching forward_batch during decode
-        # Only first request's locations are used (batch_size=1 assumption for now)
-        if reqs[0].talker_kv_cache_locs is not None:
-            self.model_specific_states["talker_kv_cache_locs"] = reqs[0].talker_kv_cache_locs
+        # Store talker KV cache locations as list (variable length per request)
+        talker_kv_cache_locs_list = [req.talker_kv_cache_locs for req in reqs]
+        if any(locs is not None for locs in talker_kv_cache_locs_list):
+            self.model_specific_states["talker_kv_cache_locs_list"] = talker_kv_cache_locs_list
 
         # Store origin_input_ids for talker prefill at first decode (1-step delay)
         if any(req.talker_needs_prefill for req in reqs):
@@ -741,6 +774,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 for req in reqs
             ]
 
+        # Store speakers for voice selection
+        self.model_specific_states["speakers"] = [
+            getattr(req, "speaker", None) or "ethan"
+            for req in reqs
+        ]
     def _compute_spec_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
