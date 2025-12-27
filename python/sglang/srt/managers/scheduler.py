@@ -748,6 +748,59 @@ class Scheduler(
         self.sessions: Dict[str, Session] = {}
         self.forward_sleep_time = None
         self._engine_paused = False
+        # Pending talker state for Qwen3-Omni overlap scheduling
+        # Maps request ID to dict with: kv_locs, codec_frame, talker_step
+        # Updated immediately after forward returns (before results processing)
+        self.pending_talker_state: Dict[str, dict] = {}
+
+    def _capture_pending_talker_state(
+        self, batch: "ScheduleBatch", batch_result: "GenerationBatchResult"
+    ):
+        """Capture Qwen3-Omni talker state immediately after forward returns.
+
+        This is called BEFORE results processing to avoid the stale state race condition
+        where the next batch's forward reads from req attributes before the
+        current batch's results processing has updated them.
+
+        Captures: kv_locs, codec_frame, talker_step
+        """
+        if batch_result is None or batch_result.logits_output is None:
+            return
+
+        logits_output = batch_result.logits_output
+
+        # Capture codec_frames for all requests (needed for next batch's prev_codec_id)
+        codec_frames = getattr(logits_output, "codec_frames", None)
+
+        # Capture from talker prefill
+        if logits_output.talker_out_cache_loc_list is not None:
+            for i, req in enumerate(batch.reqs):
+                if i < len(logits_output.talker_out_cache_loc_list):
+                    kv_locs = logits_output.talker_out_cache_loc_list[i]
+                    if kv_locs is not None:
+                        pending = self.pending_talker_state.setdefault(req.rid, {})
+                        pending["kv_locs"] = kv_locs
+                        # Store prefill_len for position calculation (needed before results processing)
+                        pending["prefill_len"] = len(kv_locs)
+                        # Capture codec_frame if available
+                        if codec_frames is not None and i < len(codec_frames):
+                            pending["codec_frame"] = codec_frames[i]
+                        # After prefill, talker_step will be 0 (first decode)
+                        pending["talker_step"] = 0
+
+        # Capture from talker decode (takes precedence over prefill)
+        if logits_output.updated_talker_kv_locs_list is not None:
+            for i, req in enumerate(batch.reqs):
+                if i < len(logits_output.updated_talker_kv_locs_list):
+                    kv_locs = logits_output.updated_talker_kv_locs_list[i]
+                    if kv_locs is not None:
+                        pending = self.pending_talker_state.setdefault(req.rid, {})
+                        pending["kv_locs"] = kv_locs
+                        # Capture codec_frame if available
+                        if codec_frames is not None and i < len(codec_frames):
+                            pending["codec_frame"] = codec_frames[i]
+                        # Increment talker_step for next decode
+                        pending["talker_step"] = pending.get("talker_step", req.talker_step) + 1
 
     def init_chunked_prefill(self):
         # Init chunked prefill
@@ -1137,7 +1190,12 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                # Pass pending talker state for Qwen3-Omni overlap scheduling
+                batch.pending_talker_state = self.pending_talker_state
                 batch_result = self.run_batch(batch)
+                # Capture Qwen3-Omni talker state immediately after forward
+                # (before results processing) to avoid stale state race condition
+                self._capture_pending_talker_state(batch, batch_result)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None

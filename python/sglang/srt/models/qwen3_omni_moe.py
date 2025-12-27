@@ -730,6 +730,9 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
         original_extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         original_extend_num_tokens = forward_batch.extend_num_tokens
         original_extend_start_loc = forward_batch.extend_start_loc
+        # Save override_req_to_token - code predictor uses actual pool, not override
+        original_override_req_to_token = forward_batch.override_req_to_token
+        forward_batch.override_req_to_token = None  # Clear for code predictor
 
         # Get memory pool references
         allocator = forward_batch.token_to_kv_pool_allocator
@@ -858,7 +861,9 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
         forward_batch.extend_seq_lens_cpu = original_extend_seq_lens_cpu
         forward_batch.extend_num_tokens = original_extend_num_tokens
         forward_batch.extend_start_loc = original_extend_start_loc
-        # Reinitialize attention metadata for caller
+        # Restore override_req_to_token for talker
+        forward_batch.override_req_to_token = original_override_req_to_token
+        # Reinitialize attention metadata for caller (uses override if set)
         forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
         # Cat generated tokens: each is [1], cat to [num_tokens], then add batch dim
@@ -1638,21 +1643,13 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
     def _save_forward_batch_state(
         self, forward_batch: ForwardBatch, save_extend: bool = False
     ) -> dict:
-        """Save forward_batch state for later restoration after talker forward."""
-        batch_size = forward_batch.batch_size
-        req_to_token_pool = forward_batch.req_to_token_pool
+        """Save forward_batch state for later restoration after talker forward.
 
-        saved_req_to_tokens = []
-        for i in range(batch_size):
-            req_idx = forward_batch.req_pool_indices[i].item()
-            seq_len = forward_batch.seq_lens[i].item()
-            saved_req_to_tokens.append(
-                req_to_token_pool.req_to_token[req_idx, :seq_len].clone()
-            )
-
+        Since we use override_req_to_token instead of mutating the shared pool,
+        we only need to save batch dimensions (no req_to_token cloning needed).
+        """
         state = {
-            "batch_size": batch_size,
-            "saved_req_to_tokens": saved_req_to_tokens,
+            "batch_size": forward_batch.batch_size,
             "req_pool_indices": forward_batch.req_pool_indices.clone(),
             "seq_lens": forward_batch.seq_lens,
             "seq_lens_cpu": forward_batch.seq_lens_cpu,
@@ -1676,19 +1673,17 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
     def _restore_forward_batch_state(
         self, forward_batch: ForwardBatch, saved_state: dict
     ) -> None:
-        """Restore forward_batch state after talker forward."""
-        req_to_token_pool = forward_batch.req_to_token_pool
+        """Restore forward_batch state after talker forward.
 
+        Since we use override_req_to_token instead of mutating the shared pool,
+        we just need to clear the override and restore batch dimensions.
+        """
+        # Clear the override (no pool mutation to undo)
+        forward_batch.override_req_to_token = None
+
+        # Restore thinker's batch dimensions
         forward_batch.batch_size = saved_state["batch_size"]
         forward_batch.req_pool_indices = saved_state["req_pool_indices"]
-        batch_size = saved_state["batch_size"]
-
-        saved_req_to_tokens = saved_state["saved_req_to_tokens"]
-        for i in range(batch_size):
-            req_idx = saved_state["req_pool_indices"][i].item()
-            saved_tokens = saved_req_to_tokens[i]
-            req_to_token_pool.req_to_token[req_idx, : len(saved_tokens)] = saved_tokens
-
         forward_batch.seq_lens = saved_state["seq_lens"]
         forward_batch.seq_lens_cpu = saved_state["seq_lens_cpu"]
         forward_batch.seq_lens_sum = saved_state["seq_lens_sum"]
@@ -1703,14 +1698,16 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
             forward_batch.extend_num_tokens = saved_state["extend_num_tokens"]
             forward_batch.extend_start_loc = saved_state["extend_start_loc"]
 
+        # Reinitialize attention metadata for thinker (no override)
         forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
     def _switch_to_talker_kv_cache_batched(
         self, forward_batch: ForwardBatch, model_states: dict
     ) -> List[torch.Tensor]:
-        """Switch forward_batch to talker KV caches for all requests.
+        """Switch forward_batch to talker KV caches using override (no pool mutation).
 
-        Allocates new KV slots, updates req_to_token mappings, and sets seq_lens.
+        Uses forward_batch.override_req_to_token instead of mutating the shared
+        req_to_token_pool. This enables overlap scheduling by avoiding race conditions.
 
         Returns:
             updated_kv_locs_list: List of updated KV cache locations per request
@@ -1718,37 +1715,40 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
         allocator = forward_batch.token_to_kv_pool_allocator
-        req_to_token_pool = forward_batch.req_to_token_pool
 
         talker_kv_locs_list = model_states.get("talker_kv_cache_locs_list", [])
         new_seq_lens = []
         new_out_cache_locs = []
         updated_kv_locs_list = []
 
+        # Allocate new KV slots and build updated locations
         for i in range(batch_size):
-            req_idx = forward_batch.req_pool_indices[i].item()
             talker_kv_locs = talker_kv_locs_list[i] if i < len(talker_kv_locs_list) else None
 
             if talker_kv_locs is not None:
-                current_len = len(talker_kv_locs)
-
                 # Allocate new KV slot for this decode step
                 new_loc = allocator.alloc(1)
                 updated_locs = torch.cat([talker_kv_locs, new_loc])
-                new_len = current_len + 1
-
-                # Switch req_to_token to talker's KV cache
-                req_to_token_pool.req_to_token[req_idx, :new_len] = updated_locs
-
-                new_seq_lens.append(new_len)
+                new_seq_lens.append(len(updated_locs))
                 new_out_cache_locs.append(new_loc)
                 updated_kv_locs_list.append(updated_locs)
             else:
                 # No talker KV cache yet (shouldn't happen in decode)
-                new_seq_lens.append(1)
                 new_loc = allocator.alloc(1)
+                new_seq_lens.append(1)
                 new_out_cache_locs.append(new_loc)
                 updated_kv_locs_list.append(new_loc)
+
+        # Build small temporary tensor for talker KV locations (NOT mutating shared pool)
+        max_len = max(new_seq_lens)
+        talker_req_to_token = torch.zeros(
+            batch_size, max_len, dtype=torch.int32, device=device
+        )
+        for i, locs in enumerate(updated_kv_locs_list):
+            talker_req_to_token[i, : len(locs)] = locs
+
+        # Set override for attention backend (avoids mutating shared req_to_token_pool)
+        forward_batch.override_req_to_token = talker_req_to_token
 
         # Update forward_batch with batched values
         forward_batch.seq_lens = torch.tensor(new_seq_lens, dtype=torch.int32, device=device)
@@ -1756,7 +1756,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         forward_batch.seq_lens_sum = sum(new_seq_lens)
         forward_batch.out_cache_loc = torch.cat(new_out_cache_locs)
 
-        # Reinitialize attention metadata
+        # Reinitialize attention metadata (will use override_req_to_token)
         forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
         return updated_kv_locs_list
@@ -1985,11 +1985,17 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
 
             # Allocate KV cache for talker prefill
             talker_out_cache_loc = allocator.alloc(talker_seq_len)
-            req_to_token_pool.req_to_token[req_idx, :talker_seq_len] = talker_out_cache_loc
             talker_out_cache_locs.append(talker_out_cache_loc)
 
+            # Build override tensor for this single request (avoids mutating shared pool)
+            talker_req_to_token = torch.zeros(
+                1, talker_seq_len, dtype=torch.int32, device=device
+            )
+            talker_req_to_token[0, :talker_seq_len] = talker_out_cache_loc
+            forward_batch.override_req_to_token = talker_req_to_token
+
             forward_batch.batch_size = 1
-            forward_batch.req_pool_indices = torch.tensor([req_idx], device=device, dtype=torch.int32)
+            forward_batch.req_pool_indices = torch.tensor([0], device=device, dtype=torch.int32)  # Use 0 for override
             forward_batch.out_cache_loc = talker_out_cache_loc
             forward_batch.seq_lens = torch.tensor([talker_seq_len], device=device, dtype=torch.int32)
             forward_batch.seq_lens_cpu = [talker_seq_len]

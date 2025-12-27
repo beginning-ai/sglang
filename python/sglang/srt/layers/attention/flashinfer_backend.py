@@ -429,6 +429,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=forward_batch.spec_info,
                 fixed_split_size=self.decode_split_tile_size,
                 disable_split_kv=False,
+                override_req_to_token=forward_batch.override_req_to_token,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrappers)
         elif forward_batch.forward_mode.is_draft_extend():
@@ -442,6 +443,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
+                override_req_to_token=forward_batch.override_req_to_token,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged, False, False
@@ -457,6 +459,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
+                override_req_to_token=forward_batch.override_req_to_token,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_verify, False, False
@@ -496,6 +499,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=None,
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
+                override_req_to_token=forward_batch.override_req_to_token,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -937,6 +941,7 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        override_req_to_token: Optional[torch.Tensor] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -952,6 +957,7 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        override_req_to_token: Optional[torch.Tensor] = None,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
@@ -965,6 +971,7 @@ class FlashInferIndicesUpdaterDecode:
             seq_lens_cpu,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            override_req_to_token=override_req_to_token,
         )
 
     def update_sliding_window(
@@ -978,6 +985,7 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        override_req_to_token: Optional[torch.Tensor] = None,
     ):
         assert self.sliding_window_size is not None
         for wrapper_id in range(2):
@@ -1015,6 +1023,7 @@ class FlashInferIndicesUpdaterDecode:
                 spec_info,
                 seq_lens_cpu=seq_lens_cpu_tmp,
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
+                override_req_to_token=override_req_to_token,
             )
 
     def update_cross_attention(
@@ -1028,6 +1037,7 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        override_req_to_token: Optional[torch.Tensor] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1049,6 +1059,7 @@ class FlashInferIndicesUpdaterDecode:
                 kv_start_idx,
                 spec_info,
                 seq_lens_cpu=seq_lens_cpu,
+                override_req_to_token=override_req_to_token,
             )
 
     def call_begin_forward(
@@ -1064,6 +1075,7 @@ class FlashInferIndicesUpdaterDecode:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        override_req_to_token: Optional[torch.Tensor] = None,
     ):
         if spec_info is None:
             bs = len(req_pool_indices)
@@ -1078,14 +1090,23 @@ class FlashInferIndicesUpdaterDecode:
                     paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
                 )
 
+            # Use override if provided (e.g., Qwen3-Omni talker KV cache switching)
+            req_to_token = self.req_to_token
+            req_to_token_stride = self.req_to_token.shape[1]
+            if override_req_to_token is not None:
+                req_to_token = override_req_to_token
+                req_to_token_stride = override_req_to_token.shape[1]
+                # Override uses sequential indices [0, 1, 2, ...]
+                req_pool_indices = torch.arange(bs, dtype=torch.int32, device="cuda")
+
             create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
+                req_to_token,
                 req_pool_indices,
                 paged_kernel_lens,
                 kv_indptr,
                 kv_start_idx,
                 kv_indices,
-                self.req_to_token.shape[1],
+                req_to_token_stride,
             )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
@@ -1200,6 +1221,7 @@ class FlashInferIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
+        override_req_to_token: Optional[torch.Tensor] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1217,6 +1239,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        override_req_to_token: Optional[torch.Tensor] = None,
     ):
         if use_ragged:
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
@@ -1242,6 +1265,7 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
+            override_req_to_token=override_req_to_token,
         )
 
     def update_sliding_window(
@@ -1257,6 +1281,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        override_req_to_token: Optional[torch.Tensor] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1291,6 +1316,7 @@ class FlashInferIndicesUpdaterPrefill:
                 spec_info,
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
                 multi_item_params=multi_item_params,
+                override_req_to_token=override_req_to_token,
             )
 
     def update_cross_attention(
@@ -1306,6 +1332,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        override_req_to_token: Optional[torch.Tensor] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1333,6 +1360,7 @@ class FlashInferIndicesUpdaterPrefill:
                 use_ragged,
                 spec_info,
                 multi_item_params=multi_item_params,
+                override_req_to_token=override_req_to_token,
             )
 
     def call_begin_forward(
@@ -1352,6 +1380,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        override_req_to_token: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1364,14 +1393,24 @@ class FlashInferIndicesUpdaterPrefill:
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
+
+            # Use override if provided (e.g., Qwen3-Omni talker KV cache switching)
+            req_to_token = self.req_to_token
+            req_to_token_stride = self.req_to_token.shape[1]
+            if override_req_to_token is not None:
+                req_to_token = override_req_to_token
+                req_to_token_stride = override_req_to_token.shape[1]
+                # Override uses sequential indices [0, 1, 2, ...]
+                req_pool_indices = torch.arange(bs, dtype=torch.int32, device="cuda")
+
             create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
+                req_to_token,
                 req_pool_indices,
                 paged_kernel_lens,
                 kv_indptr,
                 kv_start_idx,
                 kv_indices,
-                self.req_to_token.shape[1],
+                req_to_token_stride,
             )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]

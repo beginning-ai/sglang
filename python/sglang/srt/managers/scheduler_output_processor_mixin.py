@@ -236,6 +236,11 @@ def _update_qwen3_omni_state(
     if code2wav is not None:
         maybe_decode_code2wav_chunk(req, code2wav, chunk_size, left_context_size)
 
+    # NOTE: Do NOT clear pending state here!
+    # With overlap scheduling, the same request can be in multiple batches.
+    # Clearing here would remove state captured for Batch N while processing Batch N-1.
+    # The pending state is naturally overwritten when new state is captured.
+
 
 class SchedulerOutputProcessorMixin:
     """
@@ -351,6 +356,21 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
+                        # Update req state from pending before freeing
+                        # (pending state may have allocations/frames not yet stored by results processing)
+                        pending = self.pending_talker_state.pop(req.rid, None)
+                        if pending is not None:
+                            if pending.get("kv_locs") is not None:
+                                req.talker_kv_cache_locs = pending["kv_locs"]
+                            # Store pending codec_frame if not already in talker_output_codes
+                            pending_frame = pending.get("codec_frame")
+                            if pending_frame is not None:
+                                codec_token = pending_frame[0]
+                                # Don't store EOS frames or duplicates
+                                if codec_token != getattr(req, "codec_eos_token_id", None):
+                                    # Check if already stored by results processing
+                                    if not req.talker_output_codes or req.talker_output_codes[-1] != pending_frame:
+                                        req.talker_output_codes.append(pending_frame)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
                         # Qwen3-Omni: Save PCM16 audio to file
@@ -635,6 +655,22 @@ class SchedulerOutputProcessorMixin:
 
             if req.finished():
                 self.maybe_collect_routed_experts(req)
+
+                # Update req state from pending before freeing
+                # (pending state may have allocations/frames not yet stored by results processing)
+                pending = self.pending_talker_state.pop(req.rid, None)
+                if pending is not None:
+                    if pending.get("kv_locs") is not None:
+                        req.talker_kv_cache_locs = pending["kv_locs"]
+                    # Store pending codec_frame if not already in talker_output_codes
+                    pending_frame = pending.get("codec_frame")
+                    if pending_frame is not None:
+                        codec_token = pending_frame[0]
+                        # Don't store EOS frames or duplicates
+                        if codec_token != getattr(req, "codec_eos_token_id", None):
+                            # Check if already stored by results processing
+                            if not req.talker_output_codes or req.talker_output_codes[-1] != pending_frame:
+                                req.talker_output_codes.append(pending_frame)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes

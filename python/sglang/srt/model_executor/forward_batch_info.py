@@ -392,6 +392,10 @@ class ForwardBatch:
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # Override for multi-model KV cache switching (e.g., Qwen3-Omni talker)
+    # When set, attention backend uses this instead of req_to_token_pool.req_to_token
+    override_req_to_token: Optional[torch.Tensor] = None  # [batch_size, max_seq_len]
+
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
 
@@ -680,10 +684,23 @@ class ForwardBatch:
         tts_pad_embed = []
         codec_eos_token_id = None
 
+        # Check pending_talker_state for overlap scheduling
+        # pending_state[rid] is a dict with: kv_locs, codec_frame, talker_step
+        pending_state = batch.pending_talker_state or {}
+
         for req in reqs:
             thinker_done.append(req.thinker_done)
-            talker_step.append(req.talker_step)
-            talker_needs_prefill.append(req.talker_needs_prefill)
+            pending = pending_state.get(req.rid, {})
+
+            # Check if talker prefill was already done in a previous batch (captured to pending)
+            # If pending has talker KV locs, prefill is done - don't do it again
+            if pending.get("kv_locs") is not None:
+                talker_needs_prefill.append(False)
+                # Use talker_step from pending (incremented after each forward)
+                talker_step.append(pending.get("talker_step", req.talker_step))
+            else:
+                talker_needs_prefill.append(req.talker_needs_prefill)
+                talker_step.append(req.talker_step)
 
             # Prev sampled thinker token for look-ahead (or 0 placeholder)
             if req.prev_sampled_thinker_token is not None:
@@ -692,13 +709,18 @@ class ForwardBatch:
                 prev_sampled_thinker_token.append(0)  # Placeholder
 
             # Previous codec token and residual codes for talker input
-            if req.talker_codec_ids:
+            # Check pending first (for overlap scheduling), then fall back to req
+            pending_frame = pending.get("codec_frame")
+            if pending_frame is not None:
+                # Use codec_frame from pending (captured immediately after forward)
+                prev_codec_id.append(pending_frame[0])
+                prev_residual_codes.append(pending_frame[1:])
+            elif req.talker_codec_ids:
                 prev_codec_id.append(req.talker_codec_ids[-1])
+                if req.prev_residual_codes is not None:
+                    prev_residual_codes.append(req.prev_residual_codes)
             else:
                 prev_codec_id.append(0)  # Placeholder, won't be used
-
-            if req.prev_residual_codes is not None:
-                prev_residual_codes.append(req.prev_residual_codes)
 
             if req.tts_pad_embed is not None:
                 tts_pad_embed.append(req.tts_pad_embed)
@@ -709,8 +731,27 @@ class ForwardBatch:
 
         # Compute talker positions: prefill_len + talker_step for each request
         # This ensures decode positions continue from where prefill left off
+        # Note: Use pending KV locs length as prefill_len if available (for overlap scheduling)
+        talker_prefill_lens = []
+        for req in reqs:
+            pending = pending_state.get(req.rid, {})
+            pending_kv_locs = pending.get("kv_locs")
+            pending_prefill_len = pending.get("prefill_len")
+            if pending_prefill_len is not None:
+                # Use stored prefill_len from pending (set during prefill capture)
+                talker_prefill_lens.append(pending_prefill_len)
+            elif req.talker_prefill_len > 0:
+                # Use req's prefill_len (already processed by results)
+                talker_prefill_lens.append(req.talker_prefill_len)
+            elif pending_kv_locs is not None:
+                # Fallback: infer from KV locs (but this could be decode-extended)
+                # This case shouldn't happen if prefill_len is captured properly
+                talker_prefill_lens.append(len(pending_kv_locs))
+            else:
+                talker_prefill_lens.append(0)
+
         talker_positions = torch.tensor(
-            [req.talker_prefill_len + step for req, step in zip(reqs, talker_step)],
+            [prefill_len + step for prefill_len, step in zip(talker_prefill_lens, talker_step)],
             dtype=torch.long,
             device=device,
         )
@@ -747,12 +788,22 @@ class ForwardBatch:
             )  # [batch_size, 15]
 
         # Store talker KV cache locations as list (variable length per request)
-        talker_kv_cache_locs_list = [req.talker_kv_cache_locs for req in reqs]
+        # Check pending_talker_state first (for overlap scheduling), then fall back to req attribute
+        talker_kv_cache_locs_list = []
+        for req in reqs:
+            pending = pending_state.get(req.rid, {})
+            pending_locs = pending.get("kv_locs")
+            if pending_locs is not None:
+                talker_kv_cache_locs_list.append(pending_locs)
+            elif req.talker_kv_cache_locs is not None:
+                talker_kv_cache_locs_list.append(req.talker_kv_cache_locs)
+            else:
+                talker_kv_cache_locs_list.append(None)
         if any(locs is not None for locs in talker_kv_cache_locs_list):
             self.model_specific_states["talker_kv_cache_locs_list"] = talker_kv_cache_locs_list
 
         # Store origin_input_ids for talker prefill at first decode (1-step delay)
-        if any(req.talker_needs_prefill for req in reqs):
+        if any(talker_needs_prefill):
             self.model_specific_states["origin_input_ids"] = [
                 torch.tensor(req.origin_input_ids, device=device, dtype=torch.long)
                 for req in reqs

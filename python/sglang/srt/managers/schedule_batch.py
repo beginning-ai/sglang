@@ -1357,6 +1357,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
+    # Qwen3-Omni: Pending talker state for overlap scheduling
+    # Maps request ID to latest talker KV cache locations
+    pending_talker_state: Optional[dict] = None
+
     @classmethod
     def init_new(
         cls,
@@ -2254,6 +2258,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            pending_talker_state=self.pending_talker_state,
         )
 
     def copy(self):
@@ -2388,3 +2393,6 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # Qwen3-Omni: Pending talker state for overlap scheduling
+    pending_talker_state: Optional[dict] = None
