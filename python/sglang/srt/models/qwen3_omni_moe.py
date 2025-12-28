@@ -870,6 +870,192 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
         sequences = torch.cat(generated_tokens, dim=0).unsqueeze(0)  # [1, num_tokens]
         return sequences
 
+    @torch.no_grad()
+    def generate_batched(
+        self,
+        input_embeds: torch.Tensor,  # [batch_size, 2, hidden]
+        forward_batch: ForwardBatch,
+        num_tokens: int,
+        do_sample: bool = True,
+        top_k: int = 50,
+        top_p: float = 0.8,
+    ) -> torch.Tensor:
+        """Generate num_tokens codes for a batch of requests.
+
+        Runs 1 batched prefill + (num_tokens-1) batched decode steps,
+        instead of batch_size × (1 prefill + num_tokens-1 decode).
+
+        Args:
+            input_embeds: [batch_size, 2, hidden] - stack of (hidden_states, codec_embed) per request
+            forward_batch: Forward batch info
+            num_tokens: Number of tokens to generate (15 for residual codes)
+            do_sample: Whether to sample (True) or greedy decode (False)
+            top_k: Top-k sampling parameter
+            top_p: Top-p (nucleus) sampling parameter
+
+        Returns:
+            Generated tokens [batch_size, num_tokens]
+        """
+        batch_size = input_embeds.shape[0]
+        device = input_embeds.device
+        generated_tokens = []
+        all_locs = []
+
+        # === Save original forward_batch state ===
+        original_seq_lens = forward_batch.seq_lens
+        original_seq_lens_cpu = forward_batch.seq_lens_cpu
+        original_seq_lens_sum = forward_batch.seq_lens_sum
+        original_req_pool_indices = forward_batch.req_pool_indices
+        original_out_cache_loc = forward_batch.out_cache_loc
+        original_forward_mode = forward_batch.forward_mode
+        original_extend_prefix_lens = forward_batch.extend_prefix_lens
+        original_extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+        original_extend_seq_lens = forward_batch.extend_seq_lens
+        original_extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        original_extend_num_tokens = forward_batch.extend_num_tokens
+        original_extend_start_loc = forward_batch.extend_start_loc
+        original_override_req_to_token = forward_batch.override_req_to_token
+        forward_batch.override_req_to_token = None  # Clear for code predictor
+
+        # Get memory pool references
+        allocator = forward_batch.token_to_kv_pool_allocator
+        req_to_token_pool = forward_batch.req_to_token_pool
+
+        # === Allocate batch_size request slots ===
+        predictor_req_slots = req_to_token_pool.alloc(batch_size)
+        if predictor_req_slots is None:
+            raise RuntimeError("Failed to allocate request slots for batched code predictor")
+        # Convert to tensor for attention backend (alloc returns a list)
+        predictor_req_indices = torch.tensor(predictor_req_slots, dtype=torch.int32, device=device)
+
+        # Clear stale KV locations for the slots we'll use
+        for i in range(batch_size):
+            req_to_token_pool.req_to_token[predictor_req_slots[i], :] = 0
+
+        # Set code predictor's req_pool_indices
+        forward_batch.req_pool_indices = predictor_req_indices
+
+        # === Prefill (batched) ===
+        prefill_len = 2  # Each request has 2 tokens: hidden_state embed + codec embed
+        total_prefill_tokens = batch_size * prefill_len
+
+        prefill_locs = allocator.alloc(total_prefill_tokens)
+        all_locs.append(prefill_locs)
+
+        # Write prefill locations to req_to_token mapping
+        for i in range(batch_size):
+            req_to_token_pool.req_to_token[predictor_req_slots[i], :prefill_len] = \
+                prefill_locs[i * prefill_len:(i + 1) * prefill_len]
+
+        # Set code predictor's state for extend mode
+        forward_batch.seq_lens = torch.full((batch_size,), prefill_len, dtype=torch.int32, device=device)
+        forward_batch.seq_lens_cpu = torch.full((batch_size,), prefill_len, dtype=torch.int32)
+        forward_batch.seq_lens_sum = total_prefill_tokens
+        forward_batch.out_cache_loc = prefill_locs
+        forward_batch.forward_mode = ForwardMode.EXTEND
+        forward_batch.extend_prefix_lens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        forward_batch.extend_prefix_lens_cpu = [0] * batch_size
+        forward_batch.extend_seq_lens = torch.full((batch_size,), prefill_len, dtype=torch.int32, device=device)
+        forward_batch.extend_seq_lens_cpu = [prefill_len] * batch_size
+        forward_batch.extend_num_tokens = total_prefill_tokens
+        forward_batch.extend_start_loc = torch.arange(0, total_prefill_tokens, prefill_len, dtype=torch.int32, device=device)
+
+        # Create positions for prefill: [0, 1] repeated for each request -> [batch_size * 2]
+        predictor_positions = torch.arange(0, prefill_len, dtype=torch.long, device=device).repeat(batch_size)
+
+        # Flatten input_embeds: [batch_size, 2, hidden] -> [batch_size * 2, hidden]
+        prefill_embeds = input_embeds.view(total_prefill_tokens, -1)
+
+        # Reinitialize attention metadata
+        forward_batch.attn_backend.init_forward_metadata(forward_batch)
+
+        # Run prefill - clone to prevent in-place modification
+        hidden_states = self.model(
+            input_ids=None,
+            positions=predictor_positions,
+            forward_batch=forward_batch,
+            input_embeds=prefill_embeds.clone(),
+        )  # [batch_size * 2, hidden]
+
+        # Get last token's hidden state per request: [batch_size, hidden]
+        hidden_states = hidden_states.view(batch_size, prefill_len, -1)[:, -1, :]
+        logits = self.lm_head[0](hidden_states)  # [batch_size, vocab]
+
+        # Sample first tokens
+        next_tokens = self._sample(logits, do_sample, top_k, top_p).squeeze(-1)  # [batch_size]
+        generated_tokens.append(next_tokens)
+
+        # === Decode loop (batched) ===
+        current_seq_len = prefill_len
+        for step in range(1, num_tokens):
+            # Get embedding for the tokens we just generated
+            embed_layer = self.model.embed_tokens[step - 1]
+            step_embeds = embed_layer(next_tokens)  # [batch_size, hidden]
+
+            current_seq_len += 1
+
+            # Allocate KV cache for this decode step
+            decode_locs = allocator.alloc(batch_size)
+            all_locs.append(decode_locs)
+
+            # Update req_to_token mapping with new token locations
+            for i in range(batch_size):
+                req_to_token_pool.req_to_token[predictor_req_slots[i], current_seq_len - 1] = decode_locs[i]
+
+            # Update forward_batch state for decode
+            forward_batch.seq_lens = torch.full((batch_size,), current_seq_len, dtype=torch.int32, device=device)
+            forward_batch.seq_lens_cpu = torch.full((batch_size,), current_seq_len, dtype=torch.int32)
+            forward_batch.seq_lens_sum = batch_size * current_seq_len
+            forward_batch.out_cache_loc = decode_locs
+            forward_batch.forward_mode = ForwardMode.DECODE
+
+            # Positions for decode: [current_seq_len - 1] for each request
+            predictor_positions = torch.full((batch_size,), current_seq_len - 1, dtype=torch.long, device=device)
+
+            # Reinitialize attention metadata
+            forward_batch.attn_backend.init_forward_metadata(forward_batch)
+
+            # Forward pass
+            hidden_states = self.model(
+                input_ids=None,
+                positions=predictor_positions,
+                forward_batch=forward_batch,
+                input_embeds=step_embeds,
+            )  # [batch_size, hidden]
+
+            # Use appropriate lm_head for this step
+            logits = self.lm_head[step](hidden_states)
+
+            # Sample next tokens
+            next_tokens = self._sample(logits, do_sample, top_k, top_p).squeeze(-1)
+            generated_tokens.append(next_tokens)
+
+        # === Cleanup ===
+        # Free code predictor's KV cache tokens
+        allocator.free(torch.cat(all_locs))
+        # Free request slots (use original tensor from alloc)
+        req_to_token_pool.free(predictor_req_slots)
+
+        # Restore original forward_batch state
+        forward_batch.seq_lens = original_seq_lens
+        forward_batch.seq_lens_cpu = original_seq_lens_cpu
+        forward_batch.seq_lens_sum = original_seq_lens_sum
+        forward_batch.req_pool_indices = original_req_pool_indices
+        forward_batch.out_cache_loc = original_out_cache_loc
+        forward_batch.forward_mode = original_forward_mode
+        forward_batch.extend_prefix_lens = original_extend_prefix_lens
+        forward_batch.extend_prefix_lens_cpu = original_extend_prefix_lens_cpu
+        forward_batch.extend_seq_lens = original_extend_seq_lens
+        forward_batch.extend_seq_lens_cpu = original_extend_seq_lens_cpu
+        forward_batch.extend_num_tokens = original_extend_num_tokens
+        forward_batch.extend_start_loc = original_extend_start_loc
+        forward_batch.override_req_to_token = original_override_req_to_token
+        # Reinitialize attention metadata for caller (uses override if set)
+        forward_batch.attn_backend.init_forward_metadata(forward_batch)
+
+        # Stack: list of [batch_size] -> [batch_size, num_tokens]
+        return torch.stack(generated_tokens, dim=1)
+
 
 class Qwen3OmniMoeTalkerForConditionalGeneration(nn.Module):
     """Top-level Talker module with projections, codec_head, model, and code_predictor."""
@@ -1875,21 +2061,21 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         logits = self.talker.codec_head(hidden_states)  # [batch_size, vocab]
         codec_tokens = _sample_codec_tokens(logits, codec_eos_token_id)
 
-        # === 8. Run code predictor per-request (loop) ===
-        codec_frames = []
-        for i in range(batch_size):
-            codec_embed_i = self.talker.model.embed_tokens(codec_tokens[i:i+1])
-            predictor_input = torch.stack([hidden_states[i], codec_embed_i.squeeze(0)], dim=0)
-            residual_codes = self.talker.code_predictor.generate(
-                input_embeds=predictor_input,
-                forward_batch=forward_batch,
-                num_tokens=self.talker.config.code_predictor_config.num_code_groups - 1,
-                do_sample=True,
-                top_k=50,
-                top_p=0.8,
-            )
-            frame = [codec_tokens[i].item()] + residual_codes.squeeze(0).tolist()
-            codec_frames.append(frame)
+        # === 8. Run code predictor (batched) ===
+        codec_embeds = self.talker.model.embed_tokens(codec_tokens)  # [batch_size, hidden]
+        predictor_inputs = torch.stack([hidden_states, codec_embeds], dim=1)  # [batch_size, 2, hidden]
+        residual_codes = self.talker.code_predictor.generate_batched(
+            input_embeds=predictor_inputs,
+            forward_batch=forward_batch,
+            num_tokens=self.talker.config.code_predictor_config.num_code_groups - 1,
+            do_sample=True,
+            top_k=50,
+            top_p=0.8,
+        )  # [batch_size, 15]
+
+        # Build codec_frames list for compatibility
+        codec_frames_tensor = torch.cat([codec_tokens.unsqueeze(1), residual_codes], dim=1)  # [batch_size, 16]
+        codec_frames = codec_frames_tensor.tolist()
 
         # === 9. Restore forward_batch state ===
         self._restore_forward_batch_state(forward_batch, saved_state)
@@ -2088,24 +2274,21 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         logits = self.talker.codec_head(hidden_states)  # [batch_size, vocab]
         codec_tokens = _sample_codec_tokens(logits, codec_eos_token_id)
 
-        # === 5. Run code predictor per-request (loop) ===
-        codec_frames = []
-        for i in range(batch_size):
-            codec_embed_i = self.talker.model.embed_tokens(codec_tokens[i : i + 1])
-            predictor_input = torch.stack(
-                [hidden_states[i], codec_embed_i.squeeze(0)], dim=0
-            )
+        # === 5. Run code predictor (batched) ===
+        codec_embeds = self.talker.model.embed_tokens(codec_tokens)  # [batch_size, hidden]
+        predictor_inputs = torch.stack([hidden_states, codec_embeds], dim=1)  # [batch_size, 2, hidden]
+        residual_codes = self.talker.code_predictor.generate_batched(
+            input_embeds=predictor_inputs,
+            forward_batch=forward_batch,
+            num_tokens=self.talker.config.code_predictor_config.num_code_groups - 1,
+            do_sample=True,
+            top_k=50,
+            top_p=0.8,
+        )  # [batch_size, 15]
 
-            residual_codes = self.talker.code_predictor.generate(
-                input_embeds=predictor_input,
-                forward_batch=forward_batch,
-                num_tokens=self.talker.config.code_predictor_config.num_code_groups - 1,
-                do_sample=True,
-                top_k=50,
-                top_p=0.8,
-            )
-            frame = [codec_tokens[i].item()] + residual_codes.squeeze(0).tolist()
-            codec_frames.append(frame)
+        # Build codec_frames list for compatibility
+        codec_frames_tensor = torch.cat([codec_tokens.unsqueeze(1), residual_codes], dim=1)  # [batch_size, 16]
+        codec_frames = codec_frames_tensor.tolist()
 
         # === 6. Restore forward_batch state ===
         self._restore_forward_batch_state(forward_batch, saved_state)
