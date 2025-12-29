@@ -35,6 +35,7 @@ from sglang.srt.observability.req_time_stats import (
     real_time,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import get_or_create_event_loop, get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
 
@@ -140,12 +141,18 @@ class GrpcReqState:
     out_queue: asyncio.Queue
     finished: bool
     event: asyncio.Event
-    obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
+    obj: Optional[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]
 
     # Metrics (same as TokenizerManager's ReqState)
     time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
 
+    # perf_counter equivalents for accurate time calculations
+    finished_time_perf: float = 0.0
+    first_token_time_perf: float = 0.0
+
+    # Cumulative decoded text for computing deltas
+    cumulative_text: str = ""
     # Streaming state
     stream_finished: bool = False
     input_logprobs_sent: bool = False  # Track if input logprobs were sent in streaming
@@ -225,6 +232,14 @@ class GrpcRequestManager:
             self.send_to_scheduler, fan_out=server_args.dp_size
         )
 
+        # Tokenizer for decoding output tokens (gRPC bypasses detokenizer)
+        if not server_args.skip_tokenizer_init:
+            self.tokenizer = get_tokenizer(
+                server_args.tokenizer_path or server_args.model_path,
+                trust_remote_code=server_args.trust_remote_code,
+            )
+        else:
+            self.tokenizer = None
         logger.info(
             f"GrpcRequestManager initialized with ZMQ IPC: "
             f"recv={port_args.detokenizer_ipc_name}, "
@@ -484,6 +499,37 @@ class GrpcRequestManager:
 
         return True
 
+    def register_streaming_audio_request(
+        self,
+        request_id: str,
+        grpc_context: Optional[grpc.aio.ServicerContext] = None,
+    ) -> GrpcReqState:
+        """Register a streaming audio request for output routing.
+
+        This creates a minimal GrpcReqState so that scheduler outputs for
+        this request are routed to the out_queue instead of being dropped.
+        """
+        time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+        state = GrpcReqState(
+            request_id=request_id,
+            grpc_context=grpc_context,
+            out_queue=asyncio.Queue(),
+            finished=False,
+            event=asyncio.Event(),
+            obj=None,  # No tokenized input for streaming audio
+            time_stats=time_stats,
+        )
+        self.rid_to_state[request_id] = state
+        time_stats.set_created_time()
+        print(f"Registered streaming audio request: {request_id}, new state with cumulative_text=''")
+        return state
+
+    def cleanup_streaming_audio_request(self, request_id: str):
+        """Clean up a streaming audio request state."""
+        if request_id in self.rid_to_state:
+            del self.rid_to_state[request_id]
+            print(f"Cleaned up streaming audio request: {request_id}")
+
     async def handle_loop(self):
         """
         Main event loop - processes outputs from scheduler.
@@ -609,10 +655,27 @@ class GrpcRequestManager:
             else:
                 state.time_stats.set_last_time()
 
+            # Extract token IDs
+            token_ids = batch_out.output_ids[i] if batch_out.output_ids else []
+
+            # Decode tokens to text (gRPC bypasses detokenizer)
+            # output_ids contains only NEW token(s) from this decode step
+            decoded_text = ""
+            if self.tokenizer and token_ids:
+                try:
+                    decoded_text = self.tokenizer.decode(
+                        token_ids,
+                        skip_special_tokens=True,
+                    )
+                    state.cumulative_text += decoded_text
+                except Exception as e:
+                    logger.warning(f"Failed to decode tokens for {rid}: {e}")
+
             # Extract output for this request
             output_data = {
                 "request_id": rid,
-                "token_ids": batch_out.output_ids[i] if batch_out.output_ids else [],
+                "token_ids": token_ids,
+                "decoded_text": decoded_text,
                 "finished": batch_out.finished_reasons[i] is not None,
                 "meta_info": {
                     "prompt_tokens": (
@@ -699,6 +762,12 @@ class GrpcRequestManager:
             # Update state for accumulation
             if output_data["token_ids"]:
                 state.output_ids.extend(output_data["token_ids"])
+
+            # Add audio chunks if available (Qwen3-Omni streaming audio)
+            if batch_out.audio_chunks and i < len(batch_out.audio_chunks):
+                audio_chunks = batch_out.audio_chunks[i]
+                if audio_chunks:
+                    output_data["audio_chunks"] = audio_chunks
 
             # Add queue.put() to parallel task list
             put_tasks.append(state.out_queue.put(output_data))

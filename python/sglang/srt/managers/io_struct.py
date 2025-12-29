@@ -1007,6 +1007,10 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
+    # Audio output chunks from Code2Wav (Qwen3-Omni streaming audio)
+    # Each request may have multiple PCM16 audio chunks [batch_size][num_chunks_per_request]
+    audio_chunks: Optional[List[List[bytes]]] = None
+
 
 @dataclass
 class BatchMultimodalDecodeReq(BaseBatchReq):
@@ -1992,6 +1996,54 @@ class DumperControlReqOutput(BaseReq):
     error: str = ""
 
 
+# =====================
+# Streaming Audio (Qwen3-Omni)
+# =====================
+
+
+@dataclass
+class StreamingAudioStartReqInput(BaseReq):
+    """Start a streaming audio session for real-time audio-to-audio inference.
+
+    Multi-turn support:
+    - Turn 1: Provide session_id and optional system_prompt
+    - Turn 2+: Provide session_id and parent_rid (from previous turn's turn_rid)
+    """
+
+    # Required: identifies the conversation (creates session if not exists)
+    session_id: str
+    # Sampling parameters for generation (SamplingParams object)
+    sampling_params: Any
+    # Optional: extend from this turn (for turn 2+, links to previous turn's rid)
+    parent_rid: Optional[str] = None
+    # Optional: system prompt (first turn only, ignored on turn 2+)
+    system_prompt: Optional[str] = None
+    # Optional: voice name (chelsie, ethan, aiden). Default: ethan
+    speaker: Optional[str] = None
+
+
+@dataclass
+class StreamingAudioChunkReqInput(BaseReq):
+    """Add an audio chunk to an existing streaming session.
+
+    The mel_features contain mel spectrogram frames. Full chunks have 100 frames,
+    but the final flush may have fewer frames (audio encoder handles variable lengths).
+    """
+
+    # Mel spectrogram features [1, 128, num_frames]
+    mel_features: torch.Tensor
+    # Actual number of mel frames (100 for full chunks, less for remainder)
+    num_frames: int = 100
+
+
+@dataclass
+class StreamingAudioEndReqInput(BaseReq):
+    """Signal end of audio input, trigger final prefill and transition to decode."""
+
+    # Final mel features from flushed buffer (may have < 100 frames), optional
+    final_mel_features: Optional[torch.Tensor] = None
+    # Actual number of mel frames in final chunk
+    final_num_frames: int = 0
 def _check_all_req_types():
     """A helper function to check all request types are defined in this file."""
     import inspect
