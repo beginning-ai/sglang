@@ -23,9 +23,11 @@ from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
 from grpc_health.v1 import health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
-from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
+from sglang.srt.grpc import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
 import sglang
+from transformers import WhisperFeatureExtractor
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
@@ -33,8 +35,12 @@ from sglang.srt.grpc.health_servicer import SGLangHealthServicer
 from sglang.srt.grpc.scheduler_launcher import launch_scheduler_process_only
 from sglang.srt.grpc.utils import abort_code_from_output
 from sglang.srt.managers.disagg_service import start_disagg_service
+from sglang.srt.audio.streaming_buffer import StreamingAudioBuffer
 from sglang.srt.managers.io_struct import (
     GetLoadsReqOutput,
+    StreamingAudioChunkReqInput,
+    StreamingAudioEndReqInput,
+    StreamingAudioStartReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
@@ -552,6 +558,226 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         tokenized_req.need_wait_for_image = bool(encode_req.need_wait_for_image)
         tokenized_req.num_items_assigned = encode_req.num_items_assigned
 
+    async def StreamingAudio(
+        self,
+        request_iterator: AsyncIterator[sglang_scheduler_pb2.StreamingAudioRequest],
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncIterator[sglang_scheduler_pb2.StreamingAudioResponse]:
+        """Bidirectional streaming for real-time audio-to-audio inference (Qwen3-Omni).
+
+        Protocol:
+        1. Client sends StreamingAudioConfig first (text prompt, sampling params)
+        2. Client streams PCM16 audio chunks (16kHz, mono)
+        3. Client sends end_of_input=true to signal audio complete
+        4. Server streams back text deltas and audio chunks
+        5. Server sends StreamingAudioComplete when done
+        """
+        rid = None
+        audio_buffer = None
+
+        try:
+            # Process incoming stream
+            async for request in request_iterator:
+                if request.HasField("config"):
+                    # First message: setup streaming audio session
+                    rid = request.request_id
+                    logger.info(f"Starting streaming audio session: {rid}")
+
+                    # Initialize audio buffer with feature extractor
+                    # Note: Client must send 16kHz audio
+                    try:
+                        feature_extractor = WhisperFeatureExtractor.from_pretrained(
+                            "openai/whisper-large-v3",
+                            feature_size=128,  # Qwen3-Omni uses 128 mel bins
+                        )
+                        audio_buffer = StreamingAudioBuffer(feature_extractor)
+                    except Exception as e:
+                        logger.error(f"Failed to initialize audio buffer: {e}")
+                        yield sglang_scheduler_pb2.StreamingAudioResponse(
+                            request_id=rid or "unknown",
+                            error=sglang_scheduler_pb2.StreamingAudioError(
+                                message=f"Failed to initialize audio: {e}",
+                                code="AUDIO_INIT_ERROR",
+                            ),
+                        )
+                        return
+
+                    # Convert sampling params
+                    sampling_params = self._convert_sampling_params(
+                        request.config.sampling_params
+                    )
+
+                    # Extract session fields for multi-turn support
+                    session_id = request.config.session_id
+                    parent_rid = request.config.parent_rid or None
+                    system_prompt = request.config.system_prompt or None
+                    speaker = request.config.speaker or None
+
+                    if not session_id:
+                        logger.warning(f"No session_id provided, using rid as session_id: {rid}")
+                        session_id = rid
+
+                    # Send start request to scheduler
+                    start_req = StreamingAudioStartReqInput(
+                        rid=rid,
+                        session_id=session_id,
+                        sampling_params=sampling_params,
+                        parent_rid=parent_rid,
+                        system_prompt=system_prompt,
+                        speaker=speaker,
+                    )
+                    await self.request_manager._send_to_scheduler(start_req)
+
+                    # Register state so scheduler outputs are routed to our queue
+                    self.request_manager.register_streaming_audio_request(rid, context)
+
+                elif request.audio_chunk:
+                    # Process audio chunk
+                    if audio_buffer is None:
+                        logger.warning(f"Audio chunk before config: {rid}")
+                        continue
+
+                    # Buffer until 100 mel frames available
+                    result = audio_buffer.add_samples(request.audio_chunk)
+                    if result is not None:
+                        mel_features, num_frames = result
+                        # Send chunk to scheduler
+                        chunk_req = StreamingAudioChunkReqInput(
+                            rid=rid,
+                            mel_features=mel_features["input_features"],
+                            num_frames=num_frames,
+                        )
+                        await self.request_manager._send_to_scheduler(chunk_req)
+
+                elif request.end_of_input:
+                    # Flush remaining audio and signal end
+                    logger.info(f"Audio input ended: {rid}")
+
+                    final_mel = None
+                    final_num_frames = 0
+                    if audio_buffer is not None:
+                        flush_result = audio_buffer.flush()
+                        if flush_result is not None:
+                            mel_features, final_num_frames = flush_result
+                            final_mel = mel_features["input_features"]
+
+                    # Send end request to scheduler
+                    end_req = StreamingAudioEndReqInput(
+                        rid=rid,
+                        final_mel_features=final_mel,
+                        final_num_frames=final_num_frames,
+                    )
+                    await self.request_manager._send_to_scheduler(end_req)
+
+                    # Now stream output responses
+                    try:
+                        async for output in self._stream_audio_output(rid, context):
+                            yield output
+                    finally:
+                        # Clean up state
+                        self.request_manager.cleanup_streaming_audio_request(rid)
+
+                    break  # Done after streaming output
+
+        except Exception as e:
+            logger.error(f"StreamingAudio error: {e}")
+            # Clean up state on error
+            if rid:
+                self.request_manager.cleanup_streaming_audio_request(rid)
+            yield sglang_scheduler_pb2.StreamingAudioResponse(
+                request_id=rid or "unknown",
+                error=sglang_scheduler_pb2.StreamingAudioError(
+                    message=str(e),
+                    code="STREAMING_ERROR",
+                ),
+            )
+
+    async def _stream_audio_output(
+        self,
+        rid: str,
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncIterator[sglang_scheduler_pb2.StreamingAudioResponse]:
+        """Stream audio output from scheduler for a request."""
+        # Get the output queue for this request from request manager
+        state = self.request_manager.rid_to_state.get(rid)
+        if state is None:
+            logger.warning(f"No state found for rid: {rid}")
+            return
+
+        full_text = ""
+        thinker_ids = []
+        talker_ids = []
+        prompt_tokens = 0
+        completion_tokens = 0
+        timeout_count = 0
+
+        while True:
+            # Check if client cancelled
+            if context.cancelled():
+                logger.info(f"Client cancelled streaming audio: {rid}")
+                break
+
+            try:
+                # Wait for output with timeout
+                output = await asyncio.wait_for(
+                    state.out_queue.get(),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                timeout_count += 1
+                if timeout_count == 1 or timeout_count % 4 == 0:
+                    print(
+                        f"[StreamingAudio] Still waiting for scheduler output: rid={rid}, "
+                        f"timeouts={timeout_count}",
+                        flush=True,
+                    )
+                continue
+
+            timeout_count = 0
+
+            # Extract text and yield as text_delta
+            if output.get("decoded_text"):
+                text_delta = output["decoded_text"]
+                full_text += text_delta
+                yield sglang_scheduler_pb2.StreamingAudioResponse(
+                    request_id=rid,
+                    text_delta=text_delta,
+                )
+
+            # Track token IDs for final response (output_ids is cumulative)
+            if output.get("token_ids"):
+                thinker_ids = output["token_ids"]  # Replace, not extend
+
+            # Extract and yield audio chunks
+            if output.get("audio_chunks"):
+                for chunk in output["audio_chunks"]:
+                    yield sglang_scheduler_pb2.StreamingAudioResponse(
+                        request_id=rid,
+                        audio_chunk=chunk,
+                    )
+
+            # Update token counts
+            meta = output.get("meta_info", {})
+            prompt_tokens = meta.get("prompt_tokens", prompt_tokens)
+            completion_tokens = meta.get("completion_tokens", completion_tokens)
+
+            # Check if finished
+            if output.get("finished"):
+                # Use cumulative_text from state for final text
+                final_text = state.cumulative_text if state.cumulative_text else full_text
+                # Send completion message with turn_rid for multi-turn chaining
+                yield sglang_scheduler_pb2.StreamingAudioResponse(
+                    request_id=rid,
+                    complete=sglang_scheduler_pb2.StreamingAudioComplete(
+                        full_text=final_text,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        thinker_token_ids=thinker_ids,
+                        talker_token_ids=talker_ids,
+                        turn_rid=rid,  # Client uses this as parent_rid for next turn
+                    ),
+                )
+                break
     # Helper methods for request/response conversion
 
     def _convert_generate_request(

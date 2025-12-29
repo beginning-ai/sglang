@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -24,6 +25,7 @@ from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
+        AudioTurnState,
         EmbeddingBatchResult,
         GenerationBatchResult,
         ScheduleBatch,
@@ -57,16 +59,7 @@ def maybe_decode_code2wav_chunk(
     chunk_size: int = 10,
     left_context_size: int = 25,
 ) -> None:
-    """Decode new codec frames to PCM16 if enough frames have accumulated.
-
-    This should be called from the model forward path where code2wav is available.
-
-    Args:
-        req: Request object with talker_output_codes and streaming state
-        code2wav: Qwen3OmniMoeCode2Wav model instance
-        chunk_size: Number of new frames to accumulate before decoding (K)
-        left_context_size: Number of frames of left context for overlap
-    """
+    """Decode new codec frames to PCM16 if enough frames have accumulated."""
     if not req.talker_output_codes:
         return
 
@@ -81,34 +74,70 @@ def maybe_decode_code2wav_chunk(
     if len(req.talker_pcm16_chunks) >= req.talker_pcm16_chunk_cap:
         return
 
-    # Build codes tensor: [1, num_quantizers, frames]
-    # talker_output_codes is List[List[int]] where each inner list has 16 codes
     codes_list = req.talker_output_codes
-    num_quantizers = len(codes_list[0]) if codes_list else 16
-
-    # Determine context window
     context_start = max(0, req.talker_last_decoded_frame - left_context_size)
     context_size = req.talker_last_decoded_frame - context_start
 
-    # Build tensor for [context + new frames]
     codes_window = codes_list[context_start:current_frame]
     codes_tensor = torch.tensor(codes_window, dtype=torch.long, device=next(code2wav.parameters()).device)
     codes_tensor = codes_tensor.transpose(0, 1).unsqueeze(0)  # [1, num_quantizers, T]
 
-    # Run code2wav
     with torch.no_grad():
         wav_chunk = code2wav(codes_tensor)
 
-    # Crop away the context samples
+    # Take last new_frames worth of samples to handle TransConv output length variation
     total_upsample = code2wav.total_upsample
-    pcm_start = context_size * total_upsample
-    wav_new = wav_chunk[..., pcm_start:]
-
-    # Convert to PCM16 bytes and store
-    pcm16_bytes = wav_to_pcm16(wav_new)
-    req.talker_pcm16_chunks.append(pcm16_bytes)
+    expected_new_samples = new_frames * total_upsample
+    wav_new = wav_chunk[..., -expected_new_samples:]
+    if wav_new.shape[-1] > 0:
+        pcm16_bytes = wav_to_pcm16(wav_new)
+        req.talker_pcm16_chunks.append(pcm16_bytes)
 
     # Update last decoded frame
+    req.talker_last_decoded_frame = current_frame
+
+
+def flush_code2wav_chunk(
+    req: Req,
+    code2wav,
+    left_context_size: int = 25,
+) -> None:
+    """Decode any remaining frames when request finishes."""
+    if not req.talker_output_codes:
+        return
+
+    current_frame = len(req.talker_output_codes)
+    new_frames = current_frame - req.talker_last_decoded_frame
+
+    if new_frames <= 0:
+        return
+
+    if len(req.talker_pcm16_chunks) >= req.talker_pcm16_chunk_cap:
+        return
+
+    codes_list = req.talker_output_codes
+    context_start = max(0, req.talker_last_decoded_frame - left_context_size)
+
+    codes_window = codes_list[context_start:current_frame]
+    codes_tensor = torch.tensor(codes_window, dtype=torch.long, device=next(code2wav.parameters()).device)
+    codes_tensor = codes_tensor.transpose(0, 1).unsqueeze(0)  # [1, num_quantizers, T]
+
+    with torch.no_grad():
+        wav_chunk = code2wav(codes_tensor)
+
+    # Take last new_frames worth of samples, but skip final 20ms to remove end artifact
+    total_upsample = code2wav.total_upsample
+    expected_new_samples = new_frames * total_upsample
+    end_artifact_samples = 480  # 20ms at 24kHz
+    if wav_chunk.shape[-1] >= expected_new_samples + end_artifact_samples:
+        wav_new = wav_chunk[..., -(expected_new_samples + end_artifact_samples):-end_artifact_samples]
+    else:
+        wav_new = wav_chunk[..., -expected_new_samples:]
+
+    if wav_new.shape[-1] > 0:
+        pcm16_bytes = wav_to_pcm16(wav_new)
+        req.talker_pcm16_chunks.append(pcm16_bytes)
+
     req.talker_last_decoded_frame = current_frame
 
 
@@ -134,15 +163,9 @@ def save_pcm16_to_file(req: Req, code2wav=None) -> None:
     codes_tensor = torch.tensor(codes_list, dtype=torch.long, device=next(code2wav.parameters()).device)
     codes_tensor = codes_tensor.transpose(0, 1).unsqueeze(0)  # [1, num_quantizers, T]
 
-    # Run code2wav
+    # Run code2wav (batch decode)
     with torch.no_grad():
         wav_output = code2wav(codes_tensor)
-
-    # TODO: Investigate root cause of ~10ms static at end of audio.
-    # Workaround: trim last 20ms (480 samples at 24kHz) from waveform.
-    trim_samples = 480
-    if wav_output.shape[-1] > trim_samples:
-        wav_output = wav_output[..., :-trim_samples]
 
     # Convert to PCM16
     pcm16_bytes = wav_to_pcm16(wav_output)
@@ -285,6 +308,48 @@ class SchedulerOutputProcessorMixin:
             return None
         return self.tp_worker.model_runner.model.code2wav
 
+    def _store_audio_turn_state(self: "Scheduler", req: Req):
+        """Store turn state for multi-turn audio sessions.
+
+        Called when a request with audio_session_id finishes. Stores the input/output
+        state needed for subsequent turns to continue the conversation.
+        """
+        from sglang.srt.managers.scheduler import AudioTurnState
+
+        session = self.audio_sessions.get(req.audio_session_id)
+        if session is None:
+            logger.warning(
+                f"Audio session {req.audio_session_id} not found for turn {req.rid}"
+            )
+            return
+
+        # Decode the text response for history
+        text_response = ""
+        if self.tokenizer is not None and req.output_ids:
+            text_response = self.tokenizer.decode(
+                req.output_ids, skip_special_tokens=True
+            )
+
+        # Store turn state
+        session.turns[req.rid] = AudioTurnState(
+            rid=req.rid,
+            input_ids=list(req.origin_input_ids),
+            output_ids=list(req.output_ids),
+            text_response=text_response,
+            last_node=req.last_node,  # For cache locking
+        )
+        session.last_activity = time.time()
+
+        # Lock the cache node to prevent eviction during conversation
+        if req.last_node is not None:
+            self.tree_cache.inc_lock_ref(req.last_node)
+
+        logger.debug(
+            f"Stored audio turn state: session={req.audio_session_id}, "
+            f"rid={req.rid}, input_len={len(req.origin_input_ids)}, "
+            f"output_len={len(req.output_ids)}"
+        )
+
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
@@ -371,7 +436,12 @@ class SchedulerOutputProcessorMixin:
                     # decode req in mixed batch or retracted req
                     continue
 
-                if req.is_chunked <= 0:
+                prefill_audio_done = getattr(
+                    req,
+                    "_prefill_audio_done_snapshot",
+                    getattr(req, "audio_done", True),
+                )
+                if req.is_chunked <= 0 and prefill_audio_done:
                     req.time_stats.set_prefill_finished_time()
 
                     # req output_ids are set here
@@ -386,12 +456,20 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        release_kv_cache(req, self.tree_cache)
+                        is_insert = not getattr(req, "disable_prefix_cache", False)
+                        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
                         req.time_stats.set_completion_time()
+                        # Qwen3-Omni: Flush remaining audio frames for streaming
+                        flush_code2wav_chunk(req, code2wav=code2wav)
                         # Qwen3-Omni: Save PCM16 audio to file
                         save_pcm16_to_file(req, code2wav=code2wav)
+                        # Clean up streaming audio tracking
+                        self.streaming_audio_reqs.pop(req.rid, None)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        self.tree_cache.cache_unfinished_req(req)
+                        # This updates radix so others can match
+                        # Skip for streaming audio to prevent cache pollution
+                        if not getattr(req, "disable_prefix_cache", False):
+                            self.tree_cache.cache_unfinished_req(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -445,8 +523,8 @@ class SchedulerOutputProcessorMixin:
                             self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
 
-                else:
-                    # being chunked reqs' prefill is not finished
+                elif req.is_chunked > 0:
+                    # Regular chunked prefill - decrement counter
                     req.is_chunked -= 1
                     # There is only at most one request being currently chunked.
                     # Because this request does not finish prefill,
@@ -474,6 +552,20 @@ class SchedulerOutputProcessorMixin:
                             logprob_pt += num_input_logprobs
 
                     req.time_stats.set_last_chunked_prefill_finish_time()
+                else:
+                    # Streaming audio intermediate prefill (audio_done=False, is_chunked<=0)
+                    # Cache KV to radix tree and free req_pool_idx so next prefill
+                    # can get a fresh allocation and reuse the cached KV
+
+                    # Cache the KV we just computed - fill_ids was set by init_next_round_input
+                    self.tree_cache.cache_unfinished_req(req, chunked=True)
+
+                    # Free the req slot so next prefill allocates fresh.
+                    # The KV values at the cached cache_locs remain valid.
+                    self.req_to_token_pool.free(req)
+
+                    # Don't stream output during intermediate prefills
+                    skip_stream_req = req
 
         else:  # embedding or reward model
             if result.copy_done is not None:
@@ -649,16 +741,23 @@ class SchedulerOutputProcessorMixin:
                             del pixel_values
                 self.maybe_collect_routed_experts(req)
 
+                # Skip radix cache insert for streaming audio to prevent cache pollution
+                is_insert = not getattr(req, 'disable_prefix_cache', False)
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
-                        release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
                 else:
-                    release_kv_cache(req, self.tree_cache)
+                    release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
                 req.time_stats.set_completion_time()
+                # Qwen3-Omni: Flush remaining audio frames for streaming
+                flush_code2wav_chunk(req, code2wav=code2wav)
                 # Qwen3-Omni: Save PCM16 audio to file
                 save_pcm16_to_file(req, code2wav=code2wav)
+
+                # Clean up streaming audio tracking
+                self.streaming_audio_reqs.pop(req.rid, None)
 
             self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -1106,6 +1205,8 @@ class SchedulerOutputProcessorMixin:
         customized_info = {}
 
         time_stats = []
+        # Streaming audio output (Qwen3-Omni)
+        audio_chunks = []
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -1147,6 +1248,11 @@ class SchedulerOutputProcessorMixin:
                 req.finished_output = True
                 if req.finished_len is None:
                     req.finished_len = len(req.output_ids)
+
+                # Store turn state for multi-turn audio sessions
+                if req.audio_session_id:
+                    self._store_audio_turn_state(req)
+
                 should_output = True
             else:
                 if req.stream:
@@ -1212,6 +1318,12 @@ class SchedulerOutputProcessorMixin:
                 retraction_counts.append(req.retraction_count)
 
                 time_stats.append(req.time_stats)
+                # Extract audio chunks (Qwen3-Omni streaming audio output)
+                if req.talker_pcm16_chunks:
+                    audio_chunks.append(req.talker_pcm16_chunks.copy())
+                    req.talker_pcm16_chunks.clear()
+                else:
+                    audio_chunks.append([])
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -1355,6 +1467,7 @@ class SchedulerOutputProcessorMixin:
                     retraction_counts=retraction_counts,
                     load=load,
                     dp_ranks=dp_ranks,
+                    audio_chunks=audio_chunks if any(audio_chunks) else None,
                 )
             )
 

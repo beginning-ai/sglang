@@ -623,6 +623,11 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
+        # If last_node is None (e.g., when disable_prefix_cache is True),
+        # no lock is needed since there's no cached prefix to protect
+        if last_node is None:
+            yield None
+            return
         try:
             if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
                 swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
@@ -794,8 +799,8 @@ class PrefillAdder:
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
-
-                self._req_inc_lock_ref(req)
+                if req.last_node is not None:
+                    self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -828,8 +833,8 @@ class PrefillAdder:
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
-
-                self._req_inc_lock_ref(req)
+                if req.last_node is not None:
+                    self._req_inc_lock_ref(req)
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()

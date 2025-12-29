@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package sglang.grpc.scheduler;
+
+// Standard scheduler RPCs/messages come from smg_grpc_proto/proto/sglang_scheduler.proto.
+// We keep only the local Qwen3-Omni streaming-audio extension here.
+import "smg_grpc_proto/proto/sglang_scheduler.proto";
+
+message StreamingAudioRequest {
+  string request_id = 1;
+
+  oneof request {
+    StreamingAudioConfig config = 2;
+    bytes audio_chunk = 3;
+    bool end_of_input = 4;
+  }
+}
+
+message StreamingAudioConfig {
+  string session_id = 1;
+  string parent_rid = 2;
+  string system_prompt = 3;
+  SamplingParams sampling_params = 4;
+  string speaker = 5;
+}
+
+message StreamingAudioResponse {
+  string request_id = 1;
+
+  oneof response {
+    string text_delta = 2;
+    bytes audio_chunk = 3;
+    StreamingAudioComplete complete = 4;
+    StreamingAudioError error = 5;
+  }
+}
+
+message StreamingAudioComplete {
+  string full_text = 1;
+  int32 prompt_tokens = 2;
+  int32 completion_tokens = 3;
+  repeated uint32 thinker_token_ids = 4;
+  repeated uint32 talker_token_ids = 5;
+  string turn_rid = 6;
+}
+
+message StreamingAudioError {
+  string message = 1;
+  string code = 2;
+}
