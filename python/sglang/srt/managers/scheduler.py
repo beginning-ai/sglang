@@ -110,6 +110,9 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    StreamingAudioChunkReqInput,
+    StreamingAudioEndReqInput,
+    StreamingAudioStartReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
@@ -127,7 +130,9 @@ from sglang.srt.managers.prefill_delayer import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    Modality,
     ModelWorkerBatch,
+    MultimodalDataItem,
     MultimodalInputs,
     Req,
     RequestStage,
@@ -752,6 +757,8 @@ class Scheduler(
         # Maps request ID to dict with: kv_locs, codec_frame, talker_step
         # Updated immediately after forward returns (before results processing)
         self.pending_talker_state: Dict[str, dict] = {}
+        # Streaming audio request tracking - maps rid to Req for audio chunk/end handlers
+        self.streaming_audio_reqs: Dict[str, Req] = {}
 
     def _capture_pending_talker_state(
         self, batch: "ScheduleBatch", batch_result: "GenerationBatchResult"
@@ -1129,6 +1136,10 @@ class Scheduler(
                 (GetLoadReqInput, self.get_load),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                # Streaming audio (Qwen3-Omni)
+                (StreamingAudioStartReqInput, self.handle_streaming_audio_start),
+                (StreamingAudioChunkReqInput, self.handle_streaming_audio_chunk),
+                (StreamingAudioEndReqInput, self.handle_streaming_audio_end),
             ]
         )
 
@@ -1933,12 +1944,33 @@ class Scheduler(
 
             # Merge the new batch into the running batch.
             # For prefill-only batch, we can avoid going through decoding step.
+            # For streaming audio, don't merge until audio input is complete.
             if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
-                if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
-                else:
-                    # Merge running_batch with prefill batch
-                    self.running_batch.merge_batch(self.last_batch)
+                # Filter out:
+                # 1. Streaming audio requests where audio input was not complete when prefill started
+                #    Use the snapshot to avoid race condition where handle_streaming_audio_end
+                #    sets audio_done=True during GPU forward.
+                # 2. Finished requests (already in running_batch and will be/were removed)
+                # 3. Requests already in running_batch (avoid duplicates)
+                existing_rids = {r.rid for r in self.running_batch.reqs}
+                reqs_to_merge = [
+                    r for r in self.last_batch.reqs
+                    if getattr(r, '_prefill_audio_done_snapshot', getattr(r, 'audio_done', True))
+                    and not r.finished()
+                    and r.rid not in existing_rids
+                ]
+                if reqs_to_merge:
+                    # Create a filtered batch or merge selectively
+                    if len(reqs_to_merge) == len(self.last_batch.reqs):
+                        # All requests can be merged
+                        if self.running_batch.is_empty():
+                            self.running_batch = self.last_batch
+                        else:
+                            self.running_batch.merge_batch(self.last_batch)
+                    else:
+                        # Only merge non-streaming/non-finished requests
+                        # For now, skip merge if any need filtering - they'll be picked up later
+                        pass
 
         new_batch = self.get_new_batch_prefill()
 
@@ -2162,6 +2194,11 @@ class Scheduler(
                     self.metrics_collector.observe_queue_time(
                         req.time_stats.get_queueing_time(),
                     )
+
+            # Snapshot audio_done state for streaming audio requests.
+            # This prevents race condition where handle_streaming_audio_end sets
+            # audio_done=True during GPU forward, causing incorrect result processing.
+            req._prefill_audio_done_snapshot = getattr(req, 'audio_done', True)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -2907,6 +2944,240 @@ class Scheduler(
 
     def get_remote_instance_transfer_engine_info(self):
         return self.tp_worker.get_remote_instance_transfer_engine_info()
+
+    def _remove_req_from_running_batch(self, req: Req):
+        """Remove a request from running_batch.
+
+        Used for streaming audio when we need to schedule more prefill
+        for additional audio chunks after the request was already added
+        to running_batch from a previous prefill.
+        """
+        if req not in self.running_batch.reqs:
+            return
+
+        idx = self.running_batch.reqs.index(req)
+        self.running_batch.reqs.pop(idx)
+
+        # Also remove from corresponding batch tensors
+        if len(self.running_batch.reqs) == 0:
+            # Reset to empty batch
+            self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+        else:
+            # Remove the entry at idx from all batch tensors
+            keep_mask = torch.ones(len(self.running_batch.reqs) + 1, dtype=torch.bool)
+            keep_mask[idx] = False
+            keep_indices = torch.where(keep_mask)[0]
+
+            if self.running_batch.req_pool_indices is not None:
+                self.running_batch.req_pool_indices = self.running_batch.req_pool_indices[keep_indices]
+            if self.running_batch.seq_lens is not None:
+                self.running_batch.seq_lens = self.running_batch.seq_lens[keep_indices]
+            if self.running_batch.seq_lens_cpu is not None:
+                self.running_batch.seq_lens_cpu = self.running_batch.seq_lens_cpu[keep_indices]
+            if self.running_batch.orig_seq_lens is not None:
+                self.running_batch.orig_seq_lens = self.running_batch.orig_seq_lens[keep_indices]
+            if self.running_batch.output_ids is not None:
+                self.running_batch.output_ids = self.running_batch.output_ids[keep_indices]
+
+    def handle_streaming_audio_start(self, recv_req: StreamingAudioStartReqInput):
+        """Create a request for streaming audio-to-audio session.
+
+        This creates a request in streaming mode that will wait for audio chunks
+        before transitioning to decode phase.
+
+        Qwen3-Omni audio format (text BEFORE audio):
+        <|im_start|>user\n{text}<|audio_start|><|audio_pad|>*N<|audio_end|><|im_end|>\n<|im_start|>assistant\n
+        """
+        # Get sampling params (already a SamplingParams object)
+        sampling_params = recv_req.sampling_params
+        # Normalize to initialize stop_strs and other fields
+        sampling_params.normalize(self.tokenizer)
+
+        # Token IDs for Qwen3-Omni audio format
+        IM_START = 151644
+        IM_END = 151645
+        AUDIO_START = 151669
+        AUDIO_END = 151670
+        USER = 872
+        ASSISTANT = 77091
+        NEWLINE = 198
+
+        # Build prefix: <|im_start|>user\n{text}<|audio_start|>
+        # Text comes BEFORE audio in Qwen3-Omni format
+        input_ids = [IM_START, USER, NEWLINE]
+
+        # Add text prompt tokens
+        text_prompt = recv_req.text_prompt
+        if text_prompt and self.tokenizer is not None:
+            text_tokens = self.tokenizer.encode(text_prompt, add_special_tokens=False)
+            input_ids.extend(text_tokens)
+
+        # Add audio_start token - audio pad tokens will be added by handle_streaming_audio_chunk
+        input_ids.append(AUDIO_START)
+
+        # Get codec_eos_token_id for Qwen3-Omni (from talker_config inside hf_config)
+        talker_config = getattr(self.model_config.hf_config, "talker_config", None)
+        codec_eos_token_id = getattr(talker_config, "codec_eos_token_id", None) if talker_config else None
+
+        # Create the request with all necessary parameters
+        req = Req(
+            rid=recv_req.rid,
+            origin_input_text=recv_req.text_prompt,
+            origin_input_ids=input_ids,
+            sampling_params=sampling_params,
+            stream=True,  # Always stream for audio
+            eos_token_ids=self.model_config.hf_eos_token_id,
+            vocab_size=self.model_config.vocab_size,
+            codec_eos_token_id=codec_eos_token_id,
+        )
+        req.tokenizer = self.tokenizer
+        req.is_streaming_audio = True
+        req.audio_done = False  # Suppress output until audio complete
+        req.streaming_audio_suffix_added = False
+        req.streaming_audio_chunk_idx = 0
+        # Use unique extra_key for prefix cache isolation instead of disabling
+        # This allows KV cache reuse within this request while preventing cross-request pollution
+        req.extra_key = f"streaming_audio_{req.rid}"
+
+        # Add to tracking
+        self.streaming_audio_reqs[req.rid] = req
+
+        # Add to waiting_queue immediately for text prefix prefill
+        # This reduces latency by prefilling text while waiting for audio
+        self.waiting_queue.append(req)
+
+        return None
+
+    def handle_streaming_audio_chunk(self, recv_req: StreamingAudioChunkReqInput):
+        """Handle incoming audio chunk, merge into request and schedule prefill.
+
+        The mel_features should be exactly 100 mel frames (CNN boundary).
+        """
+        req = self.streaming_audio_reqs.get(recv_req.rid)
+        if req is None:
+            logger.warning(f"Streaming audio chunk for unknown rid: {recv_req.rid}")
+            return None
+
+        if not req.is_streaming_audio:
+            logger.warning(f"Audio chunk for non-streaming request: {recv_req.rid}")
+            return None
+
+        # Create MultimodalDataItem for this audio chunk FIRST to get pad_value
+        # mel_features shape: [1, 128, 100] - always padded to 100 frames for batching
+        mel_features = recv_req.mel_features
+        mel_num_frames = mel_features.shape[-1]  # Should be 100 (padded)
+
+        mm_item = MultimodalDataItem(
+            modality=Modality.AUDIO,
+            feature=mel_features,
+        )
+        # Create attention mask matching mel features shape (100 frames)
+        # For intermediate chunks, all frames are valid (full 100-frame chunks)
+        mm_item.feature_attention_mask = torch.ones(1, mel_num_frames, dtype=torch.long)
+        mm_item.set_pad_value()  # Computes hash-based pad_value
+
+        # Add placeholder tokens using pad_value (NOT audio_pad token ID!)
+        # Use 13 tokens per 100-frame chunk (CNN output is fixed for padded input)
+        # Note: This differs from transformers which calculates exact tokens for partial chunks
+        n_audio_tokens = 13
+
+        # Record position before adding tokens for offset calculation
+        start_pos = len(req.origin_input_ids)
+        req.origin_input_ids.extend([mm_item.pad_value] * n_audio_tokens)
+        end_pos = len(req.origin_input_ids) - 1  # inclusive end
+
+        mm_item.offsets = [(start_pos, end_pos)]  # Where audio tokens are in input_ids
+
+        # Merge into request's multimodal inputs
+        if req.multimodal_inputs is None:
+            req.multimodal_inputs = MultimodalInputs(mm_items=[mm_item])
+        else:
+            req.multimodal_inputs.mm_items.append(mm_item)
+
+        # Increment chunk counter
+        req.streaming_audio_chunk_idx += 1
+
+        # KV caching is handled in process_batch_result_prefill when audio_done=False
+        # By then, req_pool_idx is freed to allow fresh allocation for next prefill
+        # The cached cache_locs in radix tree remain valid and will be reused
+
+        # Add to waiting_queue for next prefill (if not already there)
+        if req not in self.waiting_queue:
+            self.waiting_queue.append(req)
+
+        return None
+
+    def handle_streaming_audio_end(self, recv_req: StreamingAudioEndReqInput):
+        """Signal end of audio input, finalize prefill and transition to decode.
+
+        This marks the audio input as complete. If there's a final padded chunk,
+        it will be processed. After this, the request transitions to normal
+        decode mode.
+        """
+        req = self.streaming_audio_reqs.get(recv_req.rid)
+        if req is None:
+            logger.warning(f"Streaming audio end for unknown rid: {recv_req.rid}")
+            return None
+
+        req.audio_done = True
+        req.is_streaming_audio = False  # No more chunks expected
+
+        # Token IDs for Qwen3-Omni audio format
+        IM_START = 151644
+        IM_END = 151645
+        AUDIO_END = 151670
+        ASSISTANT = 77091
+        NEWLINE = 198
+
+        # Process final chunk if provided (padded to 100 frames for batching)
+        if recv_req.final_mel_features is not None and recv_req.final_num_frames > 0:
+            # Create MultimodalDataItem FIRST to get pad_value
+            mel_features = recv_req.final_mel_features
+            mel_num_frames = mel_features.shape[-1]  # Should be 100 (padded)
+            actual_num_frames = recv_req.final_num_frames  # Actual frames before padding
+
+            mm_item = MultimodalDataItem(
+                modality=Modality.AUDIO,
+                feature=mel_features,
+            )
+            # Create attention mask marking only ACTUAL frames as valid
+            # This is critical - the audio encoder uses this to filter out padding
+            mm_item.feature_attention_mask = torch.zeros(1, mel_num_frames, dtype=torch.long)
+            mm_item.feature_attention_mask[0, :actual_num_frames] = 1
+            mm_item.set_pad_value()  # Computes hash-based pad_value
+
+            # Calculate token count for partial chunk using audio encoder formula
+            # Formula: ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 where feat_lengths = (input-1)//2+1
+            feat_lengths = (actual_num_frames - 1) // 2 + 1
+            n_audio_tokens = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1
+
+            # Record position before adding tokens for offset calculation
+            start_pos = len(req.origin_input_ids)
+            req.origin_input_ids.extend([mm_item.pad_value] * n_audio_tokens)
+            end_pos = len(req.origin_input_ids) - 1  # inclusive end
+
+            mm_item.offsets = [(start_pos, end_pos)]  # Where audio tokens are in input_ids
+            if req.multimodal_inputs is None:
+                req.multimodal_inputs = MultimodalInputs(mm_items=[mm_item])
+            else:
+                req.multimodal_inputs.mm_items.append(mm_item)
+
+        # Add suffix: <|audio_end|><|im_end|>\n<|im_start|>assistant\n
+        # Note: text prompt is already added at the start in handle_streaming_audio_start
+        if not req.streaming_audio_suffix_added:
+            # Add audio_end and ending tokens
+            req.origin_input_ids.extend([AUDIO_END, IM_END, NEWLINE, IM_START, ASSISTANT, NEWLINE])
+            req.streaming_audio_suffix_added = True
+
+        # KV caching is handled in process_batch_result_prefill when audio_done=False
+        # After this handler sets audio_done=True, the final prefill will enter the
+        # normal path and generate output tokens
+
+        # Add to waiting_queue for final prefill (if not already there)
+        if req not in self.waiting_queue:
+            self.waiting_queue.append(req)
+
+        return None
 
 
 class IdleSleeper:

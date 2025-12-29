@@ -545,11 +545,14 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         else:
             audio_feature_lengths = None
 
+        # The audio encoder uses windowed attention via cu_seqlens.
+        # Each chunk is processed independently with its own attention window.
         feature_lens = (
             audio_feature_lengths
             if audio_feature_lengths is not None
             else feature_attention_mask.sum(-1)
         )
+
         audio_outputs = self.audio_tower(
             input_features,
             feature_lens=feature_lens,
@@ -1269,7 +1272,7 @@ class Qwen3OmniMoeCausalTransConvNet(nn.Module):
         self.conv = nn.ConvTranspose1d(in_channels, out_channels, kernel_size, stride=stride)
         pad = kernel_size - stride
         self.left_pad = math.ceil(pad)
-        self.right_pad = pad - self.left_pad
+        self.right_pad = self.left_pad
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         hidden_state = self.conv(hidden_state)
@@ -1612,7 +1615,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         # Embed codes and average across quantizers
         hidden = self.code_embedding(codes + self.code_offset).mean(1)  # [B, T, hidden_size]
 
-        # Transformer
+        # Transformer - each chunk uses relative positions (0 to seq_len)
         hidden = self.pre_transformer(hidden)
 
         # Permute for conv: [B, T, C] -> [B, C, T]
@@ -1768,6 +1771,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                 for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                 if forward_batch.mm_inputs[i] is not None
             ]
+            # Debug: log multimodal processing
             input_embeds, _ = embed_mm_inputs(
                 mm_inputs_list=mm_inputs_list,
                 extend_prefix_lens=extend_prefix_lens,
@@ -2131,7 +2135,6 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         saved_state = self._save_forward_batch_state(forward_batch, save_extend=True)
 
         allocator = forward_batch.token_to_kv_pool_allocator
-        req_to_token_pool = forward_batch.req_to_token_pool
         vocab_size = self.thinker.model.embed_tokens.num_embeddings
 
         # Save original req_pool_indices before we modify it in the loop

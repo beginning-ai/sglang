@@ -777,6 +777,11 @@ class Req:
         self.talker_last_decoded_frame: int = 0  # Last codec frame decoded to PCM
         self.talker_pcm16_chunk_cap: int = 1000  # Max chunks to buffer
 
+        # Streaming audio input state (for real-time audio-to-audio)
+        self.is_streaming_audio: bool = False  # True if expecting more audio chunks
+        self.audio_done: bool = True  # False during streaming, True when complete (default True for non-streaming)
+        self.streaming_audio_chunk_idx: int = 0  # Number of audio chunks processed
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -874,7 +879,10 @@ class Req:
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
 
-        if tree_cache is not None:
+        # Skip prefix cache matching if disabled (e.g., for streaming audio with
+        # multimodal inputs that use hash-based pad_values - these would cause
+        # cache pollution between requests with same audio content)
+        if tree_cache is not None and not getattr(self, 'disable_prefix_cache', False):
             match_result = tree_cache.match_prefix(
                 key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
                 **(

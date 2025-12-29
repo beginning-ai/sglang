@@ -494,3 +494,59 @@ class GetServerInfoResponse(_message.Message):
     server_type: str
     start_time: _timestamp_pb2.Timestamp
     def __init__(self, server_args: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., scheduler_info: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., active_requests: _Optional[int] = ..., is_paused: bool = ..., last_receive_timestamp: _Optional[float] = ..., uptime_seconds: _Optional[float] = ..., sglang_version: _Optional[str] = ..., server_type: _Optional[str] = ..., start_time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+
+class StreamingAudioRequest(_message.Message):
+    __slots__ = ("request_id", "config", "audio_chunk", "end_of_input")
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    CONFIG_FIELD_NUMBER: _ClassVar[int]
+    AUDIO_CHUNK_FIELD_NUMBER: _ClassVar[int]
+    END_OF_INPUT_FIELD_NUMBER: _ClassVar[int]
+    request_id: str
+    config: StreamingAudioConfig
+    audio_chunk: bytes
+    end_of_input: bool
+    def __init__(self, request_id: _Optional[str] = ..., config: _Optional[_Union[StreamingAudioConfig, _Mapping]] = ..., audio_chunk: _Optional[bytes] = ..., end_of_input: bool = ...) -> None: ...
+
+class StreamingAudioConfig(_message.Message):
+    __slots__ = ("text_prompt", "sampling_params")
+    TEXT_PROMPT_FIELD_NUMBER: _ClassVar[int]
+    SAMPLING_PARAMS_FIELD_NUMBER: _ClassVar[int]
+    text_prompt: str
+    sampling_params: SamplingParams
+    def __init__(self, text_prompt: _Optional[str] = ..., sampling_params: _Optional[_Union[SamplingParams, _Mapping]] = ...) -> None: ...
+
+class StreamingAudioResponse(_message.Message):
+    __slots__ = ("request_id", "text_delta", "audio_chunk", "complete", "error")
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    TEXT_DELTA_FIELD_NUMBER: _ClassVar[int]
+    AUDIO_CHUNK_FIELD_NUMBER: _ClassVar[int]
+    COMPLETE_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    request_id: str
+    text_delta: str
+    audio_chunk: bytes
+    complete: StreamingAudioComplete
+    error: StreamingAudioError
+    def __init__(self, request_id: _Optional[str] = ..., text_delta: _Optional[str] = ..., audio_chunk: _Optional[bytes] = ..., complete: _Optional[_Union[StreamingAudioComplete, _Mapping]] = ..., error: _Optional[_Union[StreamingAudioError, _Mapping]] = ...) -> None: ...
+
+class StreamingAudioComplete(_message.Message):
+    __slots__ = ("full_text", "prompt_tokens", "completion_tokens", "thinker_token_ids", "talker_token_ids")
+    FULL_TEXT_FIELD_NUMBER: _ClassVar[int]
+    PROMPT_TOKENS_FIELD_NUMBER: _ClassVar[int]
+    COMPLETION_TOKENS_FIELD_NUMBER: _ClassVar[int]
+    THINKER_TOKEN_IDS_FIELD_NUMBER: _ClassVar[int]
+    TALKER_TOKEN_IDS_FIELD_NUMBER: _ClassVar[int]
+    full_text: str
+    prompt_tokens: int
+    completion_tokens: int
+    thinker_token_ids: _containers.RepeatedScalarFieldContainer[int]
+    talker_token_ids: _containers.RepeatedScalarFieldContainer[int]
+    def __init__(self, full_text: _Optional[str] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., thinker_token_ids: _Optional[_Iterable[int]] = ..., talker_token_ids: _Optional[_Iterable[int]] = ...) -> None: ...
+
+class StreamingAudioError(_message.Message):
+    __slots__ = ("message", "code")
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    CODE_FIELD_NUMBER: _ClassVar[int]
+    message: str
+    code: str
+    def __init__(self, message: _Optional[str] = ..., code: _Optional[str] = ...) -> None: ...

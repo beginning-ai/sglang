@@ -26,6 +26,8 @@ service SglangScheduler {
   // Get server information
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
 
+  // Bidirectional streaming for real-time audio-to-audio (Qwen3-Omni)
+  rpc StreamingAudio(stream StreamingAudioRequest) returns (stream StreamingAudioResponse);
 }
 
 // =====================
@@ -463,4 +465,52 @@ message GetServerInfoResponse {
   // Scheduler-side metrics (memory usage, throughput) require
   // bidirectional communicator infrastructure not available in gRPC.
   // Use HTTP /get_server_info if scheduler internal state is needed.
+}
+
+// =====================
+// Streaming Audio (Qwen3-Omni)
+// =====================
+
+// Client → Server: Bidirectional streaming request for real-time audio
+message StreamingAudioRequest {
+  string request_id = 1;
+
+  oneof request {
+    StreamingAudioConfig config = 2;      // First message: session setup
+    bytes audio_chunk = 3;                 // PCM16 audio data (16kHz, mono)
+    bool end_of_input = 4;                 // Signal end of audio input
+  }
+}
+
+// Configuration for streaming audio session
+message StreamingAudioConfig {
+  string text_prompt = 1;                  // System/user prompt text
+  SamplingParams sampling_params = 2;      // Generation parameters
+}
+
+// Server → Client: Streaming response with text and audio output
+message StreamingAudioResponse {
+  string request_id = 1;
+
+  oneof response {
+    string text_delta = 2;                 // Generated text token(s)
+    bytes audio_chunk = 3;                 // Raw PCM16 audio data (24kHz, mono)
+    StreamingAudioComplete complete = 4;   // Generation finished
+    StreamingAudioError error = 5;         // Error occurred
+  }
+}
+
+// Completion message with final statistics
+message StreamingAudioComplete {
+  string full_text = 1;                    // Complete generated text
+  int32 prompt_tokens = 2;                 // Number of prompt tokens
+  int32 completion_tokens = 3;             // Number of completion tokens
+  repeated uint32 thinker_token_ids = 4;   // Thinker output token IDs (text)
+  repeated uint32 talker_token_ids = 5;    // Talker output token IDs (codec frames, flattened)
+}
+
+// Error message for streaming audio
+message StreamingAudioError {
+  string message = 1;                      // Error message
+  string code = 2;                         // Error code
 }

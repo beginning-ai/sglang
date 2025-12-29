@@ -879,8 +879,10 @@ class ForwardBatch:
                 # 3 * N
                 if (
                     mm_input is None
+                    or mm_input.mrope_position_delta is None
                     or get_global_server_args().rl_on_policy_target is not None
                 ):
+                    # text only (or audio-only without vision mrope positions)
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
                         self.seq_lens_cpu[batch_idx] - 1,
@@ -898,9 +900,10 @@ class ForwardBatch:
                 )
                 if (
                     mm_input is None
+                    or mm_input.mrope_positions is None
                     or get_global_server_args().rl_on_policy_target is not None
                 ):
-                    # text only
+                    # text only (or audio-only without vision mrope positions)
                     mrope_positions = torch.tensor(
                         [
                             [

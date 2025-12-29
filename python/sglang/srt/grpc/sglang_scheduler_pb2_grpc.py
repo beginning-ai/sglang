@@ -69,6 +69,11 @@ class SglangSchedulerStub(object):
                 request_serializer=sglang__scheduler__pb2.GetServerInfoRequest.SerializeToString,
                 response_deserializer=sglang__scheduler__pb2.GetServerInfoResponse.FromString,
                 _registered_method=True)
+        self.StreamingAudio = channel.stream_stream(
+                '/sglang.grpc.scheduler.SglangScheduler/StreamingAudio',
+                request_serializer=sglang__scheduler__pb2.StreamingAudioRequest.SerializeToString,
+                response_deserializer=sglang__scheduler__pb2.StreamingAudioResponse.FromString,
+                _registered_method=True)
 
 
 class SglangSchedulerServicer(object):
@@ -118,6 +123,13 @@ class SglangSchedulerServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def StreamingAudio(self, request_iterator, context):
+        """Bidirectional streaming for real-time audio-to-audio (Qwen3-Omni)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_SglangSchedulerServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -150,6 +162,11 @@ def add_SglangSchedulerServicer_to_server(servicer, server):
                     servicer.GetServerInfo,
                     request_deserializer=sglang__scheduler__pb2.GetServerInfoRequest.FromString,
                     response_serializer=sglang__scheduler__pb2.GetServerInfoResponse.SerializeToString,
+            ),
+            'StreamingAudio': grpc.stream_stream_rpc_method_handler(
+                    servicer.StreamingAudio,
+                    request_deserializer=sglang__scheduler__pb2.StreamingAudioRequest.FromString,
+                    response_serializer=sglang__scheduler__pb2.StreamingAudioResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -316,6 +333,33 @@ class SglangScheduler(object):
             '/sglang.grpc.scheduler.SglangScheduler/GetServerInfo',
             sglang__scheduler__pb2.GetServerInfoRequest.SerializeToString,
             sglang__scheduler__pb2.GetServerInfoResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StreamingAudio(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_stream(
+            request_iterator,
+            target,
+            '/sglang.grpc.scheduler.SglangScheduler/StreamingAudio',
+            sglang__scheduler__pb2.StreamingAudioRequest.SerializeToString,
+            sglang__scheduler__pb2.StreamingAudioResponse.FromString,
             options,
             channel_credentials,
             insecure,
