@@ -447,11 +447,24 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                         request.config.sampling_params
                     )
 
+                    # Extract session fields for multi-turn support
+                    session_id = request.config.session_id
+                    parent_rid = request.config.parent_rid or None
+                    system_prompt = request.config.system_prompt or None
+                    speaker = request.config.speaker or None
+
+                    if not session_id:
+                        logger.warning(f"No session_id provided, using rid as session_id: {rid}")
+                        session_id = rid
+
                     # Send start request to scheduler
                     start_req = StreamingAudioStartReqInput(
                         rid=rid,
-                        text_prompt=request.config.text_prompt,
+                        session_id=session_id,
                         sampling_params=sampling_params,
+                        parent_rid=parent_rid,
+                        system_prompt=system_prompt,
+                        speaker=speaker,
                     )
                     await self.request_manager._send_to_scheduler(start_req)
 
@@ -583,7 +596,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             if output.get("finished"):
                 # Use cumulative_text from state for final text
                 final_text = state.cumulative_text if state.cumulative_text else full_text
-                # Send completion message
+                # Send completion message with turn_rid for multi-turn chaining
                 yield sglang_scheduler_pb2.StreamingAudioResponse(
                     request_id=rid,
                     complete=sglang_scheduler_pb2.StreamingAudioComplete(
@@ -592,6 +605,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                         completion_tokens=completion_tokens,
                         thinker_token_ids=thinker_ids,
                         talker_token_ids=talker_ids,
+                        turn_rid=rid,  # Client uses this as parent_rid for next turn
                     ),
                 )
                 break

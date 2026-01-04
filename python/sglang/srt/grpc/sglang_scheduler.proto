@@ -484,8 +484,11 @@ message StreamingAudioRequest {
 
 // Configuration for streaming audio session
 message StreamingAudioConfig {
-  string text_prompt = 1;                  // System/user prompt text
-  SamplingParams sampling_params = 2;      // Generation parameters
+  string session_id = 1;                   // Required: identifies the conversation (creates session if missing)
+  string parent_rid = 2;                   // Optional: extend from this turn (for turn 2+)
+  string system_prompt = 3;                // Optional: system prompt (first turn only, ignored on turn 2+)
+  SamplingParams sampling_params = 4;      // Generation parameters
+  string speaker = 5;                      // Optional: voice name (chelsie, ethan, aiden). Default: ethan
 }
 
 // Server → Client: Streaming response with text and audio output
@@ -507,6 +510,7 @@ message StreamingAudioComplete {
   int32 completion_tokens = 3;             // Number of completion tokens
   repeated uint32 thinker_token_ids = 4;   // Thinker output token IDs (text)
   repeated uint32 talker_token_ids = 5;    // Talker output token IDs (codec frames, flattened)
+  string turn_rid = 6;                     // Request ID for this turn (use as parent_rid for next turn)
 }
 
 // Error message for streaming audio

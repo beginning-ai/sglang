@@ -809,6 +809,12 @@ class ForwardBatch:
                 for req in reqs
             ]
 
+        # Store speakers for voice selection
+        self.model_specific_states["speakers"] = [
+            getattr(req, "speaker", None) or "ethan"
+            for req in reqs
+        ]
+
     def _compute_spec_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):

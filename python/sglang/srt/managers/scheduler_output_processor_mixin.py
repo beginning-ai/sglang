@@ -27,6 +27,7 @@ from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
+        AudioTurnState,
         EmbeddingBatchResult,
         GenerationBatchResult,
         ScheduleBatch,
@@ -274,6 +275,48 @@ class SchedulerOutputProcessorMixin:
         if getattr(self.model_config.hf_config, "model_type", None) != "qwen3_omni_moe":
             return None
         return self.tp_worker.model_runner.model.code2wav
+
+    def _store_audio_turn_state(self: "Scheduler", req: Req):
+        """Store turn state for multi-turn audio sessions.
+
+        Called when a request with audio_session_id finishes. Stores the input/output
+        state needed for subsequent turns to continue the conversation.
+        """
+        from sglang.srt.managers.scheduler import AudioTurnState
+
+        session = self.audio_sessions.get(req.audio_session_id)
+        if session is None:
+            logger.warning(
+                f"Audio session {req.audio_session_id} not found for turn {req.rid}"
+            )
+            return
+
+        # Decode the text response for history
+        text_response = ""
+        if self.tokenizer is not None and req.output_ids:
+            text_response = self.tokenizer.decode(
+                req.output_ids, skip_special_tokens=True
+            )
+
+        # Store turn state
+        session.turns[req.rid] = AudioTurnState(
+            rid=req.rid,
+            input_ids=list(req.origin_input_ids),
+            output_ids=list(req.output_ids),
+            text_response=text_response,
+            last_node=req.last_node,  # For cache locking
+        )
+        session.last_activity = time.time()
+
+        # Lock the cache node to prevent eviction during conversation
+        if req.last_node is not None:
+            self.tree_cache.inc_lock_ref(req.last_node)
+
+        logger.debug(
+            f"Stored audio turn state: session={req.audio_session_id}, "
+            f"rid={req.rid}, input_len={len(req.origin_input_ids)}, "
+            f"output_len={len(req.output_ids)}"
+        )
 
     def process_batch_result_prebuilt(self: "Scheduler", batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -1224,6 +1267,11 @@ class SchedulerOutputProcessorMixin:
                 req.finished_output = True
                 if req.finished_len is None:
                     req.finished_len = len(req.output_ids)
+
+                # Store turn state for multi-turn audio sessions
+                if req.audio_session_id:
+                    self._store_audio_turn_state(req)
+
                 should_output = True
             else:
                 if req.stream:

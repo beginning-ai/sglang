@@ -240,6 +240,34 @@ class EmbeddingBatchResult:
         self.copy_done.record()
 
 
+@dataclass
+class AudioTurnState:
+    """State for a single turn in a multi-turn audio session."""
+
+    rid: str  # Request ID for this turn
+    input_ids: List[int]  # Full input_ids including history
+    output_ids: List[int]  # Generated tokens (thinker output)
+    text_response: str  # Decoded assistant text response
+    last_node: Optional[Any] = None  # Radix tree node for cache locking
+
+
+@dataclass
+class AudioSessionState:
+    """State for a multi-turn audio conversation session."""
+
+    session_id: str
+    system_prompt: Optional[str] = None  # Set on first turn
+    speaker: Optional[str] = None  # Voice name (persists across session)
+    turns: Dict[str, AudioTurnState] = None  # rid → turn state
+    last_activity: float = 0.0  # Time of last activity for timeout cleanup
+
+    def __post_init__(self):
+        if self.turns is None:
+            self.turns = {}
+        if self.last_activity == 0.0:
+            self.last_activity = time.time()
+
+
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerUpdateWeightsMixin,
@@ -759,6 +787,8 @@ class Scheduler(
         self.pending_talker_state: Dict[str, dict] = {}
         # Streaming audio request tracking - maps rid to Req for audio chunk/end handlers
         self.streaming_audio_reqs: Dict[str, Req] = {}
+        # Multi-turn audio session state - maps session_id to AudioSessionState
+        self.audio_sessions: Dict[str, AudioSessionState] = {}
 
     def _capture_pending_talker_state(
         self, batch: "ScheduleBatch", batch_result: "GenerationBatchResult"
@@ -2982,11 +3012,13 @@ class Scheduler(
     def handle_streaming_audio_start(self, recv_req: StreamingAudioStartReqInput):
         """Create a request for streaming audio-to-audio session.
 
-        This creates a request in streaming mode that will wait for audio chunks
-        before transitioning to decode phase.
+        Multi-turn support:
+        - Turn 1: Provide session_id and optional system_prompt
+        - Turn 2+: Provide session_id and parent_rid (from previous turn's turn_rid)
 
-        Qwen3-Omni audio format (text BEFORE audio):
-        <|im_start|>user\n{text}<|audio_start|><|audio_pad|>*N<|audio_end|><|im_end|>\n<|im_start|>assistant\n
+        Qwen3-Omni audio format:
+        Turn 1: <|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n<|audio_start|>...
+        Turn 2: ...cached...<|im_end|>\n<|im_start|>user\n<|audio_start|>...
         """
         # Get sampling params (already a SamplingParams object)
         sampling_params = recv_req.sampling_params
@@ -2997,23 +3029,54 @@ class Scheduler(
         IM_START = 151644
         IM_END = 151645
         AUDIO_START = 151669
-        AUDIO_END = 151670
+        SYSTEM = 9125
         USER = 872
-        ASSISTANT = 77091
         NEWLINE = 198
 
-        # Build prefix: <|im_start|>user\n{text}<|audio_start|>
-        # Text comes BEFORE audio in Qwen3-Omni format
-        input_ids = [IM_START, USER, NEWLINE]
+        session_id = recv_req.session_id
+        parent_rid = recv_req.parent_rid
 
-        # Add text prompt tokens
-        text_prompt = recv_req.text_prompt
-        if text_prompt and self.tokenizer is not None:
-            text_tokens = self.tokenizer.encode(text_prompt, add_special_tokens=False)
-            input_ids.extend(text_tokens)
+        # Get or create session
+        session = self.audio_sessions.get(session_id)
+        if session is None:
+            # First turn: create new session
+            session = AudioSessionState(
+                session_id=session_id,
+                system_prompt=recv_req.system_prompt,
+                speaker=recv_req.speaker or "ethan",  # Default to ethan
+            )
+            self.audio_sessions[session_id] = session
 
-        # Add audio_start token - audio pad tokens will be added by handle_streaming_audio_chunk
-        input_ids.append(AUDIO_START)
+        # Update last activity for timeout tracking
+        session.last_activity = time.time()
+
+        if parent_rid:
+            # Turn 2+: extend from parent turn
+            parent_turn = session.turns.get(parent_rid)
+            if parent_turn is None:
+                logger.warning(f"Parent turn {parent_rid} not found in session {session_id}")
+                return None
+
+            # Build continuation: parent's full history + assistant response + new user header
+            # parent.input_ids = everything up to and including previous <|im_start|>assistant\n
+            # parent.output_ids = assistant's generated tokens (text)
+            # We need to add: <|im_end|>\n<|im_start|>user\n<|audio_start|>
+            input_ids = list(parent_turn.input_ids) + list(parent_turn.output_ids)
+            input_ids.extend([IM_END, NEWLINE, IM_START, USER, NEWLINE, AUDIO_START])
+        else:
+            # First turn: build from system prompt
+            input_ids = []
+
+            # Add system prompt if provided
+            system_prompt = recv_req.system_prompt or session.system_prompt
+            if system_prompt and self.tokenizer is not None:
+                input_ids.extend([IM_START, SYSTEM, NEWLINE])
+                system_tokens = self.tokenizer.encode(system_prompt, add_special_tokens=False)
+                input_ids.extend(system_tokens)
+                input_ids.extend([IM_END, NEWLINE])
+
+            # Add user header with audio start
+            input_ids.extend([IM_START, USER, NEWLINE, AUDIO_START])
 
         # Get codec_eos_token_id for Qwen3-Omni (from talker_config inside hf_config)
         talker_config = getattr(self.model_config.hf_config, "talker_config", None)
@@ -3022,7 +3085,7 @@ class Scheduler(
         # Create the request with all necessary parameters
         req = Req(
             rid=recv_req.rid,
-            origin_input_text=recv_req.text_prompt,
+            origin_input_text=recv_req.system_prompt or "",
             origin_input_ids=input_ids,
             sampling_params=sampling_params,
             stream=True,  # Always stream for audio
@@ -3035,9 +3098,12 @@ class Scheduler(
         req.audio_done = False  # Suppress output until audio complete
         req.streaming_audio_suffix_added = False
         req.streaming_audio_chunk_idx = 0
-        # Use unique extra_key for prefix cache isolation instead of disabling
-        # This allows KV cache reuse within this request while preventing cross-request pollution
-        req.extra_key = f"streaming_audio_{req.rid}"
+        # Store session_id for later turn state storage
+        req.audio_session_id = session_id
+        # Store speaker for audio generation
+        req.speaker = session.speaker
+        # Use session_id as extra_key for prefix cache isolation and reuse within session
+        req.extra_key = f"audio_session_{session_id}"
 
         # Add to tracking
         self.streaming_audio_reqs[req.rid] = req
@@ -3178,6 +3244,34 @@ class Scheduler(
             self.waiting_queue.append(req)
 
         return None
+
+    def cleanup_stale_audio_sessions(self, timeout: float = 300.0):
+        """Clean up audio sessions that haven't been active for a while.
+
+        Args:
+            timeout: Sessions inactive for more than this many seconds will be removed.
+                    Default is 300 seconds (5 minutes).
+        """
+        if not self.audio_sessions:
+            return
+
+        now = time.time()
+        stale_session_ids = [
+            sid
+            for sid, session in self.audio_sessions.items()
+            if now - session.last_activity > timeout
+        ]
+
+        for sid in stale_session_ids:
+            session = self.audio_sessions.pop(sid)
+            # Unlock all cached turns to allow eviction
+            for turn in session.turns.values():
+                if turn.last_node is not None:
+                    self.tree_cache.dec_lock_ref(turn.last_node)
+            logger.info(
+                f"Cleaned up stale audio session: {sid} "
+                f"(inactive for {now - session.last_activity:.1f}s, {len(session.turns)} turns)"
+            )
 
 
 class IdleSleeper:

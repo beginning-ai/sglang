@@ -781,6 +781,8 @@ class Req:
         self.is_streaming_audio: bool = False  # True if expecting more audio chunks
         self.audio_done: bool = True  # False during streaming, True when complete (default True for non-streaming)
         self.streaming_audio_chunk_idx: int = 0  # Number of audio chunks processed
+        self.audio_session_id: Optional[str] = None  # Session ID for multi-turn audio
+        self.speaker: Optional[str] = None  # Voice name for audio generation
 
     @property
     def seqlen(self) -> int:

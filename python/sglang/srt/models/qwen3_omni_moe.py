@@ -2145,6 +2145,9 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         talker_out_cache_locs = []
         tts_pad_embeds_out = []
 
+        # Get speakers from model_specific_states
+        speakers = forward_batch.model_specific_states.get("speakers", None) if forward_batch.model_specific_states else None
+
         for i in range(batch_size):
             full_input_ids = origin_input_ids[i]
             full_input_ids = full_input_ids.clamp(min=0, max=vocab_size - 1)
@@ -2153,10 +2156,12 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
 
             # Compute thinker_embeds for building talker input
             thinker_embeds = self.thinker.model.embed_tokens(full_input_ids)
+            speaker = speakers[i] if speakers else "ethan"
             talker_input_embeds, tts_pad_embed_new = self._prepare_talker_prefill_1step(
                 thinker_embeds=thinker_embeds,
                 input_ids=full_input_ids,
                 first_response_token=first_token,
+                speaker=speaker,
             )
 
             # Use new tts_pad_embed if computed
@@ -2307,11 +2312,15 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         thinker_embeds: torch.Tensor,
         input_ids: torch.Tensor,
         first_response_token: torch.Tensor,
+        speaker: str = "ethan",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Build talker prefill input with actual sampled first response token.
 
         This is a simplified version of _prepare_talker_prefill for 1-step delay.
         Uses the actual sampled token (first_response_token) instead of placeholder.
+
+        Args:
+            speaker: Voice name (chelsie, ethan, aiden). Default: ethan
 
         Returns:
             talker_input_embeds: Embeddings for talker prefill [seq_len, hidden_dim]
@@ -2335,7 +2344,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         codec_think_eos_id = talker_config.codec_think_eos_id
         codec_pad_id = talker_config.codec_pad_id
         codec_bos_id = talker_config.codec_bos_id
-        speaker_id = talker_config.speaker_id.get("ethan", 2302)
+        speaker_id = talker_config.speaker_id.get(speaker.lower(), 2302)
 
         # Get tts special token embeddings
         tts_special_tokens = torch.tensor(
@@ -2420,6 +2429,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         accept_hidden: torch.Tensor,
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
+        speaker: str = "ethan",
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Build talker prefill input from thinker outputs.
@@ -2429,6 +2439,9 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         2. Skip system parts
         3. For user parts: text_projection(thinker_embeds)
         4. For assistant parts: complex structure with text+codec embeddings (element-wise add)
+
+        Args:
+            speaker: Voice name (chelsie, ethan, aiden). Default: ethan
 
         Returns:
             talker_input_embeds: Embeddings for talker prefill [seq_len, hidden_dim]
@@ -2454,8 +2467,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         codec_think_eos_id = talker_config.codec_think_eos_id
         codec_pad_id = talker_config.codec_pad_id
         codec_bos_id = talker_config.codec_bos_id
-        # Default speaker: ethan (2302)
-        speaker_id = talker_config.speaker_id.get("ethan", 2302)
+        speaker_id = talker_config.speaker_id.get(speaker.lower(), 2302)
 
         # Get tts special token embeddings from THINKER, then project with talker's text_projection
         tts_special_tokens = torch.tensor(

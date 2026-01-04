@@ -1705,14 +1705,23 @@ class LazyDumpTensorsReqOutput(BaseReq):
 
 @dataclass
 class StreamingAudioStartReqInput(BaseReq):
-    """Start a streaming audio session for real-time audio-to-audio inference."""
+    """Start a streaming audio session for real-time audio-to-audio inference.
 
-    # System/user prompt text (will be tokenized)
-    text_prompt: str
+    Multi-turn support:
+    - Turn 1: Provide session_id and optional system_prompt
+    - Turn 2+: Provide session_id and parent_rid (from previous turn's turn_rid)
+    """
+
+    # Required: identifies the conversation (creates session if not exists)
+    session_id: str
     # Sampling parameters for generation (SamplingParams object)
     sampling_params: Any
-    # Initial audio data (optional, can start with just prompt)
-    audio_data: Optional[bytes] = None
+    # Optional: extend from this turn (for turn 2+, links to previous turn's rid)
+    parent_rid: Optional[str] = None
+    # Optional: system prompt (first turn only, ignored on turn 2+)
+    system_prompt: Optional[str] = None
+    # Optional: voice name (chelsie, ethan, aiden). Default: ethan
+    speaker: Optional[str] = None
 
 
 @dataclass

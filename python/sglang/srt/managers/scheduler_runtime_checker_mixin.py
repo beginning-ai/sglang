@@ -330,6 +330,7 @@ class SchedulerRuntimeCheckerMixin:
         self.check_memory()
         self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio
+        self.cleanup_stale_audio_sessions()
         self.maybe_sleep_on_idle()
 
 
