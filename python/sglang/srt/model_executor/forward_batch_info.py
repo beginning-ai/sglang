@@ -667,6 +667,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         prev_sampled_thinker_token = []
         tts_pad_embed = []
         codec_eos_token_id = None
+        talker_temperatures = []
+        talker_top_ks = []
+        talker_top_ps = []
+        talker_repetition_penalties = []
+        talker_prev_codec_tokens = []
 
         # Check pending_talker_state for overlap scheduling
         # pending_state[rid] is a dict with: kv_locs, codec_frame, talker_step
@@ -675,6 +680,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         for req in reqs:
             thinker_done.append(req.thinker_done)
             pending = pending_state.get(req.rid, {})
+            custom_params = req.sampling_params.custom_params
+            if not isinstance(custom_params, dict):
+                custom_params = {}
 
             # Check if talker prefill was already done in a previous batch (captured to pending)
             # If pending has talker KV locs, prefill is done - don't do it again
@@ -712,6 +720,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Get codec_eos_token_id from first request that has it
             if codec_eos_token_id is None and req.codec_eos_token_id is not None:
                 codec_eos_token_id = req.codec_eos_token_id
+
+            talker_temperatures.append(custom_params.get("talker_temperature", 0.9))
+            talker_top_ks.append(custom_params.get("talker_top_k", 50))
+            talker_top_ps.append(custom_params.get("talker_top_p", 1.0))
+            talker_repetition_penalties.append(
+                custom_params.get("talker_repetition_penalty", 1.05)
+            )
+
+            prev_tokens = list(req.talker_codec_ids) if req.talker_codec_ids else []
+            pending_frame = pending.get("codec_frame")
+            if pending_frame is not None and (
+                not prev_tokens or prev_tokens[-1] != pending_frame[0]
+            ):
+                prev_tokens.append(pending_frame[0])
+            talker_prev_codec_tokens.append(prev_tokens)
 
         # Compute talker positions: prefill_len + talker_step for each request
         # This ensures decode positions continue from where prefill left off
@@ -753,6 +776,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             "prev_sampled_thinker_token": torch.tensor(
                 prev_sampled_thinker_token, dtype=torch.long, device=device
             ),
+            "talker_temperature": torch.tensor(
+                talker_temperatures, dtype=torch.float, device=device
+            ),
+            "talker_top_k": torch.tensor(
+                talker_top_ks, dtype=torch.int32, device=device
+            ),
+            "talker_top_p": torch.tensor(
+                talker_top_ps, dtype=torch.float, device=device
+            ),
+            "talker_repetition_penalty": torch.tensor(
+                talker_repetition_penalties, dtype=torch.float, device=device
+            ),
+            "talker_prev_codec_tokens": talker_prev_codec_tokens,
         }
 
         # Add codec_eos_token_id if available
@@ -795,7 +831,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Store speakers for voice selection
         self.model_specific_states["speakers"] = [
-            getattr(req, "speaker", None) or "ethan"
+            getattr(req, "speaker", None) or "chelsie"
             for req in reqs
         ]
 

@@ -66,41 +66,140 @@ from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import add_prefix, is_npu, logger
 
 
+TALKER_TEMPERATURE_DEFAULT = 0.9
+TALKER_TOP_K_DEFAULT = 50
+TALKER_TOP_P_DEFAULT = 1.0
+TALKER_REPETITION_PENALTY_DEFAULT = 1.05
+
+
 def _sample_codec_tokens(
     logits: torch.Tensor,
     codec_eos_token_id: int = 2150,
+    temperature: Union[float, torch.Tensor] = TALKER_TEMPERATURE_DEFAULT,
+    top_k: Union[int, torch.Tensor] = TALKER_TOP_K_DEFAULT,
+    top_p: Union[float, torch.Tensor] = TALKER_TOP_P_DEFAULT,
+    repetition_penalty: Union[float, torch.Tensor] = TALKER_REPETITION_PENALTY_DEFAULT,
+    prev_tokens: Optional[Union[List[int], List[List[int]]]] = None,
 ) -> torch.Tensor:
     """Sample codec tokens from logits. Works for both single and batched inputs.
 
     Args:
         logits: [vocab_size] or [batch_size, vocab_size]
         codec_eos_token_id: EOS token to preserve during suppression
+        temperature: Sampling temperature
+        top_k: Top-k sampling parameter
+        top_p: Top-p (nucleus) sampling parameter
+        repetition_penalty: Repetition penalty for previously generated tokens
+        prev_tokens: Previous codec tokens for repetition penalty
 
     Returns:
         tokens: [] scalar or [batch_size] tensor of sampled token IDs
     """
+    def _apply_repetition_penalty(
+        single_logits: torch.Tensor,
+        token_ids: Optional[List[int]],
+        penalty: float,
+    ) -> torch.Tensor:
+        if not token_ids or penalty == 1.0:
+            return single_logits
+        unique_tokens = torch.tensor(
+            list(set(token_ids)), device=single_logits.device, dtype=torch.long
+        )
+        penalized = single_logits[unique_tokens]
+        penalized = torch.where(
+            penalized < 0, penalized * penalty, penalized / penalty
+        )
+        single_logits[unique_tokens] = penalized
+        return single_logits
+
+    def _sample_single(
+        single_logits: torch.Tensor,
+        token_ids: Optional[List[int]],
+        temp: float,
+        k: int,
+        p: float,
+        penalty: float,
+    ) -> torch.Tensor:
+        vocab_size = single_logits.shape[-1]
+        single_logits = _apply_repetition_penalty(single_logits, token_ids, penalty)
+
+        suppress_start = vocab_size - 1024
+        suppress_mask = torch.zeros_like(single_logits, dtype=torch.bool)
+        suppress_mask[suppress_start:vocab_size] = True
+        if codec_eos_token_id < vocab_size:
+            suppress_mask[codec_eos_token_id] = False
+        single_logits = single_logits.masked_fill(suppress_mask, float("-inf"))
+
+        single_logits = single_logits / temp
+        if k <= 0 or k >= vocab_size:
+            probs = F.softmax(single_logits, dim=-1)
+            if p < 1.0:
+                sorted_p, sorted_idx = torch.sort(probs, descending=True, dim=-1)
+                cumsum_p = torch.cumsum(sorted_p, dim=-1)
+                mask = cumsum_p - sorted_p > p
+                sorted_p[mask] = 0.0
+                sorted_p = sorted_p / sorted_p.sum(dim=-1, keepdim=True)
+                sampled = torch.multinomial(sorted_p, 1)
+                sampled_idx = sorted_idx.gather(-1, sampled).squeeze(-1)
+                return sampled_idx
+            return torch.multinomial(probs, 1).squeeze(-1)
+
+        topk_logits, topk_indices = torch.topk(single_logits, k, dim=-1)
+        probs = F.softmax(topk_logits, dim=-1)
+        if p < 1.0:
+            sorted_p, sorted_idx = torch.sort(probs, descending=True, dim=-1)
+            cumsum_p = torch.cumsum(sorted_p, dim=-1)
+            mask = cumsum_p - sorted_p > p
+            sorted_p[mask] = 0.0
+            sorted_p = sorted_p / sorted_p.sum(dim=-1, keepdim=True)
+            sampled = torch.multinomial(sorted_p, 1)
+            sampled_idx = sorted_idx.gather(-1, sampled).squeeze(-1)
+        else:
+            sampled_idx = torch.multinomial(probs, 1).squeeze(-1)
+        return topk_indices.gather(-1, sampled_idx.unsqueeze(-1)).squeeze(-1)
+
     single_input = logits.dim() == 1
     if single_input:
         logits = logits.unsqueeze(0)
 
-    vocab_size = logits.shape[-1]
+    batch_size = logits.shape[0]
+    if isinstance(temperature, torch.Tensor):
+        temperatures = temperature.tolist()
+    else:
+        temperatures = [float(temperature)] * batch_size
+    if isinstance(top_k, torch.Tensor):
+        top_ks = [int(v) for v in top_k.tolist()]
+    else:
+        top_ks = [int(top_k)] * batch_size
+    if isinstance(top_p, torch.Tensor):
+        top_ps = top_p.tolist()
+    else:
+        top_ps = [float(top_p)] * batch_size
+    if isinstance(repetition_penalty, torch.Tensor):
+        repetition_penalties = repetition_penalty.tolist()
+    else:
+        repetition_penalties = [float(repetition_penalty)] * batch_size
 
-    # Suppress special tokens in the last 1024 vocab IDs except codec_eos
-    suppress_start = vocab_size - 1024
-    suppress_mask = torch.zeros_like(logits, dtype=torch.bool)
-    suppress_mask[:, suppress_start:vocab_size] = True
-    if codec_eos_token_id < vocab_size:
-        suppress_mask[:, codec_eos_token_id] = False
-    logits = logits.masked_fill(suppress_mask, float("-inf"))
+    if prev_tokens is None:
+        prev_tokens_list = [None] * batch_size
+    elif single_input:
+        prev_tokens_list = [prev_tokens]
+    else:
+        prev_tokens_list = prev_tokens
 
-    # Apply temperature and top-k filtering
-    logits = logits / 0.9
-    topk_logits, topk_indices = torch.topk(logits, 50, dim=-1)
-    probs = F.softmax(topk_logits, dim=-1)
-
-    # Sample from top-k distribution
-    sampled_idx = torch.multinomial(probs, 1).squeeze(-1)
-    tokens = topk_indices.gather(-1, sampled_idx.unsqueeze(-1)).squeeze(-1)
+    sampled_tokens = []
+    for i in range(batch_size):
+        sampled_tokens.append(
+            _sample_single(
+                logits[i],
+                prev_tokens_list[i],
+                temperatures[i],
+                top_ks[i],
+                top_ps[i],
+                repetition_penalties[i],
+            )
+        )
+    tokens = torch.stack(sampled_tokens, dim=0)
 
     if single_input:
         return tokens.squeeze(0)
@@ -1154,6 +1253,11 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(nn.Module):
         trailing_text_hidden: torch.Tensor = None,
         tts_pad_embed: torch.Tensor = None,
         codec_eos_token_id: int = 2150,
+        temperature: float = TALKER_TEMPERATURE_DEFAULT,
+        top_k: int = TALKER_TOP_K_DEFAULT,
+        top_p: float = TALKER_TOP_P_DEFAULT,
+        repetition_penalty: float = TALKER_REPETITION_PENALTY_DEFAULT,
+        prev_codec_tokens: Optional[List[int]] = None,
     ) -> Tuple[List[int], int]:
         """
         Args:
@@ -1186,7 +1290,15 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(nn.Module):
             logits = self.codec_head(last_hidden)  # [1, vocab_size]
 
             # Sample codec token
-            codec_token = _sample_codec_tokens(logits.squeeze(0), codec_eos_token_id).item()
+            codec_token = _sample_codec_tokens(
+                logits.squeeze(0),
+                codec_eos_token_id,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                prev_tokens=prev_codec_tokens,
+            ).item()
 
             # Run code predictor: (current_hidden, embed(codec))
             codec_embed = self.model.embed_tokens(
@@ -1240,7 +1352,15 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(nn.Module):
 
         # 4. Get logits and sample codec token
         logits = self.codec_head(hidden_states)
-        codec_token = _sample_codec_tokens(logits.squeeze(0), codec_eos_token_id).item()
+        codec_token = _sample_codec_tokens(
+            logits.squeeze(0),
+            codec_eos_token_id,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            prev_tokens=prev_codec_tokens,
+        ).item()
 
         # 5. Run code predictor: (current_hidden, embed(codec))
         codec_embed = self.model.embed_tokens(
@@ -2045,6 +2165,15 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         talker_positions = model_states.get("talker_positions", positions)  # [batch_size]
         prev_sampled_tokens = model_states.get("prev_sampled_thinker_token")  # [batch_size]
         codec_eos_token_id = model_states.get("codec_eos_token_id", 2150)
+        talker_temperature = model_states.get(
+            "talker_temperature", TALKER_TEMPERATURE_DEFAULT
+        )
+        talker_top_k = model_states.get("talker_top_k", TALKER_TOP_K_DEFAULT)
+        talker_top_p = model_states.get("talker_top_p", TALKER_TOP_P_DEFAULT)
+        talker_repetition_penalty = model_states.get(
+            "talker_repetition_penalty", TALKER_REPETITION_PENALTY_DEFAULT
+        )
+        talker_prev_codec_tokens = model_states.get("talker_prev_codec_tokens")
 
         if prev_codec_ids is None or prev_residual_codes is None:
             # No previous codec frame yet - shouldn't happen after prefill
@@ -2101,7 +2230,15 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
 
         # === 7. Sample codec tokens (batched) ===
         logits = self.talker.codec_head(hidden_states)  # [batch_size, vocab]
-        codec_tokens = _sample_codec_tokens(logits, codec_eos_token_id)
+        codec_tokens = _sample_codec_tokens(
+            logits,
+            codec_eos_token_id,
+            temperature=talker_temperature,
+            top_k=talker_top_k,
+            top_p=talker_top_p,
+            repetition_penalty=talker_repetition_penalty,
+            prev_tokens=talker_prev_codec_tokens,
+        )
 
         # === 8. Run code predictor (batched) ===
         codec_embeds = self.talker.model.embed_tokens(codec_tokens)  # [batch_size, hidden]
@@ -2147,6 +2284,15 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         prev_sampled_token = model_states.get("prev_sampled_thinker_token")
         tts_pad_embed = model_states.get("tts_pad_embed")
         codec_eos_token_id = model_states.get("codec_eos_token_id", 2150)
+        talker_temperature = model_states.get(
+            "talker_temperature", TALKER_TEMPERATURE_DEFAULT
+        )
+        talker_top_k = model_states.get("talker_top_k", TALKER_TOP_K_DEFAULT)
+        talker_top_p = model_states.get("talker_top_p", TALKER_TOP_P_DEFAULT)
+        talker_repetition_penalty = model_states.get(
+            "talker_repetition_penalty", TALKER_REPETITION_PENALTY_DEFAULT
+        )
+        talker_prev_codec_tokens = model_states.get("talker_prev_codec_tokens")
 
         # Get full input_ids for ChatML parsing
         origin_input_ids = model_states.get("origin_input_ids")
@@ -2190,6 +2336,31 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
             full_input_ids = origin_input_ids[i]
             full_input_ids = full_input_ids.clamp(min=0, max=vocab_size - 1)
             first_token = prev_sampled_token[i] if prev_sampled_token is not None else None
+            req_temperature = (
+                talker_temperature[i].item()
+                if isinstance(talker_temperature, torch.Tensor)
+                else talker_temperature
+            )
+            req_top_k = (
+                int(talker_top_k[i].item())
+                if isinstance(talker_top_k, torch.Tensor)
+                else int(talker_top_k)
+            )
+            req_top_p = (
+                talker_top_p[i].item()
+                if isinstance(talker_top_p, torch.Tensor)
+                else talker_top_p
+            )
+            req_repetition_penalty = (
+                talker_repetition_penalty[i].item()
+                if isinstance(talker_repetition_penalty, torch.Tensor)
+                else talker_repetition_penalty
+            )
+            req_prev_tokens = (
+                talker_prev_codec_tokens[i]
+                if talker_prev_codec_tokens is not None
+                else None
+            )
 
 
             # Compute thinker_embeds for building talker input
@@ -2248,6 +2419,11 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                 forward_batch=forward_batch,
                 input_embeds=talker_input_embeds,
                 codec_eos_token_id=codec_eos_token_id,
+                temperature=req_temperature,
+                top_k=req_top_k,
+                top_p=req_top_p,
+                repetition_penalty=req_repetition_penalty,
+                prev_codec_tokens=req_prev_tokens,
             )
             codec_frames.append(codec_frame)
 
@@ -2285,6 +2461,15 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         tts_pad_embed = model_states.get("tts_pad_embed")  # [batch_size, hidden]
         talker_positions = model_states.get("talker_positions")  # [batch_size]
         codec_eos_token_id = model_states.get("codec_eos_token_id", 2150)
+        talker_temperature = model_states.get(
+            "talker_temperature", TALKER_TEMPERATURE_DEFAULT
+        )
+        talker_top_k = model_states.get("talker_top_k", TALKER_TOP_K_DEFAULT)
+        talker_top_p = model_states.get("talker_top_p", TALKER_TOP_P_DEFAULT)
+        talker_repetition_penalty = model_states.get(
+            "talker_repetition_penalty", TALKER_REPETITION_PENALTY_DEFAULT
+        )
+        talker_prev_codec_tokens = model_states.get("talker_prev_codec_tokens")
 
         if prev_codec_ids is None or prev_residual_codes is None:
             return ThinkerTalkerOutput(thinker_logits=None)
@@ -2318,7 +2503,15 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
 
         # === 4. Sample codec tokens (batched) ===
         logits = self.talker.codec_head(hidden_states)  # [batch_size, vocab]
-        codec_tokens = _sample_codec_tokens(logits, codec_eos_token_id)
+        codec_tokens = _sample_codec_tokens(
+            logits,
+            codec_eos_token_id,
+            temperature=talker_temperature,
+            top_k=talker_top_k,
+            top_p=talker_top_p,
+            repetition_penalty=talker_repetition_penalty,
+            prev_tokens=talker_prev_codec_tokens,
+        )
 
         # === 5. Run code predictor (batched) ===
         codec_embeds = self.talker.model.embed_tokens(codec_tokens)  # [batch_size, hidden]
