@@ -3239,7 +3239,7 @@ class Scheduler(
         IM_START = 151644
         IM_END = 151645
         AUDIO_START = 151669
-        SYSTEM = 9125
+        SYSTEM = 8948
         USER = 872
         NEWLINE = 198
 
@@ -3272,7 +3272,10 @@ class Scheduler(
             # parent.output_ids = assistant's generated tokens (text)
             # We need to add: <|im_end|>\n<|im_start|>user\n<|audio_start|>
             input_ids = list(parent_turn.input_ids) + list(parent_turn.output_ids)
-            input_ids.extend([IM_END, NEWLINE, IM_START, USER, NEWLINE, AUDIO_START])
+            if parent_turn.output_ids and parent_turn.output_ids[-1] == IM_END:
+                input_ids.extend([NEWLINE, IM_START, USER, NEWLINE, AUDIO_START])
+            else:
+                input_ids.extend([IM_END, NEWLINE, IM_START, USER, NEWLINE, AUDIO_START])
         else:
             # First turn: build from system prompt
             input_ids = []
