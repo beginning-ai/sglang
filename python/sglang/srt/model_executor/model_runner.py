@@ -2484,6 +2484,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if hasattr(self.model, "post_cuda_graph_forward") and self.pp_group.is_last_rank:
+                ret = self.model.post_cuda_graph_forward(forward_batch, ret)
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync

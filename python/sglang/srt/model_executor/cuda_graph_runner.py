@@ -580,6 +580,8 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        if forward_batch.out_cache_loc is None:
+            return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -1024,6 +1026,7 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.model_runner.attn_backend
+        override_req_to_token = getattr(forward_batch, "override_req_to_token", None)
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
@@ -1033,6 +1036,7 @@ class CudaGraphRunner:
             self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+            override_req_to_token=override_req_to_token,
         )
 
         # Store fields

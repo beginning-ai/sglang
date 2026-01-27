@@ -697,6 +697,7 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        override_req_to_token: Optional[torch.Tensor] = None,
     ):
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -709,6 +710,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
+                override_req_to_token=override_req_to_token,
             )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -721,6 +723,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+                override_req_to_token=override_req_to_token,
             )
         elif forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
@@ -733,6 +736,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+                override_req_to_token=override_req_to_token,
             )
         elif forward_mode.is_dllm_extend():
             self.indices_updater_prefill.update(
@@ -745,6 +749,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=True,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
+                override_req_to_token=override_req_to_token,
             )
         else:
             raise ValueError("Invalid forward mode")
