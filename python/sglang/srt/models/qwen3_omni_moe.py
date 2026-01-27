@@ -48,6 +48,7 @@ from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.mm_utils import embed_mm_inputs
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
@@ -854,8 +855,6 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
         """Generate num_tokens codes autoregressively."""
         device = input_embeds.device
         generated_tokens = []
-        all_locs = []
-
         # === Save original forward_batch state ===
         # The code predictor needs isolated KV cache state, separate from talker
         original_seq_lens = forward_batch.seq_lens
@@ -870,32 +869,20 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
         original_extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         original_extend_num_tokens = forward_batch.extend_num_tokens
         original_extend_start_loc = forward_batch.extend_start_loc
-
         # Get memory pool references
         allocator = forward_batch.token_to_kv_pool_allocator
         req_to_token_pool = forward_batch.req_to_token_pool
-
-        # === Allocate isolated state for code predictor ===
-        # Allocate a new request slot for code predictor's KV cache
-        predictor_req_slots = req_to_token_pool.alloc(1)
-        if predictor_req_slots is None:
-            raise RuntimeError("Failed to allocate request slot for code predictor")
-        predictor_req_idx = predictor_req_slots[0]
-
-        # Clear any stale KV locations from previous use of this slot.
-        # This is necessary because slots are reused across requests in a batch loop,
-        # and stale indices could cause the attention backend to read wrong KV cache.
-        req_to_token_pool.req_to_token[predictor_req_idx, :] = 0
-
-        # Set code predictor's req_pool_indices
-        forward_batch.req_pool_indices = torch.tensor(
-            [predictor_req_idx], dtype=torch.int32, device=device
-        )
+        predictor_req_idx = original_req_pool_indices[0].item()
+        saved_req_to_tokens = req_to_token_pool.req_to_token[
+            predictor_req_idx, : original_seq_lens[0].item()
+        ].clone()
 
         # === Prefill ===
         prefill_len = input_embeds.shape[0]
-        prefill_loc = allocator.alloc(prefill_len)
-        all_locs.append(prefill_loc)
+        kv_locs = allocator.alloc(prefill_len + num_tokens - 1)
+        if kv_locs is None:
+            raise RuntimeError("Failed to allocate KV cache for code predictor")
+        prefill_loc = kv_locs[:prefill_len]
 
         # Write prefill locations to req_to_token mapping
         req_to_token_pool.req_to_token[predictor_req_idx, :prefill_len] = prefill_loc
@@ -947,9 +934,7 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
             predictor_positions = predictor_positions[-1:] + 1
             current_seq_len += 1
 
-            # Allocate KV cache for this decode step
-            decode_loc = allocator.alloc(1)
-            all_locs.append(decode_loc)
+            decode_loc = kv_locs[current_seq_len - 1 : current_seq_len]
 
             # Update req_to_token mapping with new token location
             req_to_token_pool.req_to_token[predictor_req_idx, current_seq_len - 1] = decode_loc
@@ -981,9 +966,10 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
 
         # === Cleanup ===
         # Free code predictor's KV cache tokens
-        allocator.free(torch.cat(all_locs))
-        # Free request slot
-        req_to_token_pool.free(predictor_req_idx)
+        allocator.free(kv_locs)
+        req_to_token_pool.req_to_token[predictor_req_idx, : len(saved_req_to_tokens)] = (
+            saved_req_to_tokens
+        )
 
         # Restore original forward_batch state
         forward_batch.seq_lens = original_seq_lens
@@ -998,7 +984,6 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
         forward_batch.extend_seq_lens_cpu = original_extend_seq_lens_cpu
         forward_batch.extend_num_tokens = original_extend_num_tokens
         forward_batch.extend_start_loc = original_extend_start_loc
-        # Reinitialize attention metadata for caller
         forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
         # Cat generated tokens: each is [1], cat to [num_tokens], then add batch dim
@@ -1034,8 +1019,6 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
         batch_size = input_embeds.shape[0]
         device = input_embeds.device
         generated_tokens = []
-        all_locs = []
-
         # === Save original forward_batch state ===
         original_seq_lens = forward_batch.seq_lens
         original_seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -1049,38 +1032,33 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
         original_extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         original_extend_num_tokens = forward_batch.extend_num_tokens
         original_extend_start_loc = forward_batch.extend_start_loc
-        original_override_req_to_token = forward_batch.override_req_to_token
-        forward_batch.override_req_to_token = None  # Clear for code predictor
 
         # Get memory pool references
         allocator = forward_batch.token_to_kv_pool_allocator
         req_to_token_pool = forward_batch.req_to_token_pool
 
-        # === Allocate batch_size request slots ===
-        predictor_req_slots = req_to_token_pool.alloc(batch_size)
-        if predictor_req_slots is None:
-            raise RuntimeError("Failed to allocate request slots for batched code predictor")
-        # Convert to tensor for attention backend (alloc returns a list)
-        predictor_req_indices = torch.tensor(predictor_req_slots, dtype=torch.int32, device=device)
-
-        # Clear stale KV locations for the slots we'll use
+        saved_req_to_tokens = []
         for i in range(batch_size):
-            req_to_token_pool.req_to_token[predictor_req_slots[i], :] = 0
-
-        # Set code predictor's req_pool_indices
-        forward_batch.req_pool_indices = predictor_req_indices
+            req_idx = original_req_pool_indices[i].item()
+            seq_len = original_seq_lens[i].item()
+            saved_req_to_tokens.append(
+                req_to_token_pool.req_to_token[req_idx, :seq_len].clone()
+            )
 
         # === Prefill (batched) ===
         prefill_len = 2  # Each request has 2 tokens: hidden_state embed + codec embed
         total_prefill_tokens = batch_size * prefill_len
 
-        prefill_locs = allocator.alloc(total_prefill_tokens)
-        all_locs.append(prefill_locs)
+        kv_len = prefill_len + num_tokens - 1
+        kv_locs = allocator.alloc(batch_size * kv_len)
+        if kv_locs is None:
+            raise RuntimeError("Failed to allocate KV cache for code predictor")
+        kv_locs = kv_locs.view(batch_size, kv_len)
+        prefill_locs = kv_locs[:, :prefill_len].reshape(-1).contiguous()
 
-        # Write prefill locations to req_to_token mapping
         for i in range(batch_size):
-            req_to_token_pool.req_to_token[predictor_req_slots[i], :prefill_len] = \
-                prefill_locs[i * prefill_len:(i + 1) * prefill_len]
+            req_idx = original_req_pool_indices[i].item()
+            req_to_token_pool.req_to_token[req_idx, :prefill_len] = kv_locs[i, :prefill_len]
 
         # Set code predictor's state for extend mode
         forward_batch.seq_lens = torch.full((batch_size,), prefill_len, dtype=torch.int32, device=device)
@@ -1129,13 +1107,13 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
 
             current_seq_len += 1
 
-            # Allocate KV cache for this decode step
-            decode_locs = allocator.alloc(batch_size)
-            all_locs.append(decode_locs)
+            decode_locs = kv_locs[:, current_seq_len - 1].contiguous()
 
-            # Update req_to_token mapping with new token locations
             for i in range(batch_size):
-                req_to_token_pool.req_to_token[predictor_req_slots[i], current_seq_len - 1] = decode_locs[i]
+                req_idx = original_req_pool_indices[i].item()
+                req_to_token_pool.req_to_token[req_idx, current_seq_len - 1] = (
+                    decode_locs[i]
+                )
 
             # Update forward_batch state for decode
             forward_batch.seq_lens = torch.full((batch_size,), current_seq_len, dtype=torch.int32, device=device)
@@ -1166,10 +1144,11 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
             generated_tokens.append(next_tokens)
 
         # === Cleanup ===
-        # Free code predictor's KV cache tokens
-        allocator.free(torch.cat(all_locs))
-        # Free request slots (use original tensor from alloc)
-        req_to_token_pool.free(predictor_req_slots)
+        allocator.free(kv_locs.reshape(-1))
+        for i in range(batch_size):
+            req_idx = original_req_pool_indices[i].item()
+            saved_tokens = saved_req_to_tokens[i]
+            req_to_token_pool.req_to_token[req_idx, : len(saved_tokens)] = saved_tokens
 
         # Restore original forward_batch state
         forward_batch.seq_lens = original_seq_lens
@@ -1184,8 +1163,6 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(nn.Module):
         forward_batch.extend_seq_lens_cpu = original_extend_seq_lens_cpu
         forward_batch.extend_num_tokens = original_extend_num_tokens
         forward_batch.extend_start_loc = original_extend_start_loc
-        forward_batch.override_req_to_token = original_override_req_to_token
-        # Reinitialize attention metadata for caller (uses override if set)
         forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
         # Stack: list of [batch_size] -> [batch_size, num_tokens]
@@ -1895,8 +1872,22 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
 
         if is_prefill:
             return self._forward_prefill(input_ids, positions, forward_batch, input_embeds)
-        else:
-            return self._forward_decode(input_ids, positions, forward_batch)
+        if get_is_capture_mode() and forward_batch.forward_mode.is_decode():
+            # CUDA graph capture only records the thinker path; talker runs after replay.
+            thinker_result = self.thinker.model(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+            )
+            if isinstance(thinker_result, tuple):
+                thinker_hidden, _ = thinker_result
+            else:
+                thinker_hidden = thinker_result
+            return self.thinker.logits_processor(
+                input_ids, thinker_hidden, self.thinker.lm_head, forward_batch
+            )
+
+        return self._forward_decode(input_ids, positions, forward_batch)
 
     def _forward_prefill(
         self,
@@ -2029,14 +2020,11 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
 
         forward_batch.batch_size = saved_state["batch_size"]
         forward_batch.req_pool_indices = saved_state["req_pool_indices"]
-        batch_size = saved_state["batch_size"]
-
         saved_req_to_tokens = saved_state["saved_req_to_tokens"]
-        for i in range(batch_size):
+        for i in range(saved_state["batch_size"]):
             req_idx = saved_state["req_pool_indices"][i].item()
             saved_tokens = saved_req_to_tokens[i]
             req_to_token_pool.req_to_token[req_idx, : len(saved_tokens)] = saved_tokens
-
         forward_batch.seq_lens = saved_state["seq_lens"]
         forward_batch.seq_lens_cpu = saved_state["seq_lens_cpu"]
         forward_batch.seq_lens_sum = saved_state["seq_lens_sum"]
@@ -2051,18 +2039,14 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
             forward_batch.extend_num_tokens = saved_state["extend_num_tokens"]
             forward_batch.extend_start_loc = saved_state["extend_start_loc"]
 
+        # Reinitialize attention metadata for thinker.
         forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
     def _switch_to_talker_kv_cache_batched(
         self, forward_batch: ForwardBatch, model_states: dict
     ) -> List[torch.Tensor]:
-        """Switch forward_batch to talker KV caches for all requests.
-
-        Allocates new KV slots, updates req_to_token mappings, and sets seq_lens.
-
-        Returns:
-            updated_kv_locs_list: List of updated KV cache locations per request
-        """
+        """Switch forward_batch to talker KV caches for all requests."""
+        """Switch forward_batch to talker KV caches for all requests."""
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
         allocator = forward_batch.token_to_kv_pool_allocator
@@ -2078,23 +2062,17 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
             talker_kv_locs = talker_kv_locs_list[i] if i < len(talker_kv_locs_list) else None
 
             if talker_kv_locs is not None:
-                current_len = len(talker_kv_locs)
-
                 # Allocate new KV slot for this decode step
                 new_loc = allocator.alloc(1)
                 updated_locs = torch.cat([talker_kv_locs, new_loc])
-                new_len = current_len + 1
-
-                # Switch req_to_token to talker's KV cache
-                req_to_token_pool.req_to_token[req_idx, :new_len] = updated_locs
-
-                new_seq_lens.append(new_len)
+                req_to_token_pool.req_to_token[req_idx, : len(updated_locs)] = updated_locs
+                new_seq_lens.append(len(updated_locs))
                 new_out_cache_locs.append(new_loc)
                 updated_kv_locs_list.append(updated_locs)
             else:
-                # No talker KV cache yet (shouldn't happen in decode)
-                new_seq_lens.append(1)
                 new_loc = allocator.alloc(1)
+                req_to_token_pool.req_to_token[req_idx, 0] = new_loc
+                new_seq_lens.append(1)
                 new_out_cache_locs.append(new_loc)
                 updated_kv_locs_list.append(new_loc)
 
@@ -2104,7 +2082,6 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         forward_batch.seq_lens_sum = sum(new_seq_lens)
         forward_batch.out_cache_loc = torch.cat(new_out_cache_locs)
 
-        # Reinitialize attention metadata
         forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
         return updated_kv_locs_list
@@ -2184,6 +2161,11 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                 req_prev_tokens.append(None)
 
         saved_state = self._save_forward_batch_state(forward_batch, save_extend=True)
+        original_req_pool_indices = saved_state["req_pool_indices"]
+        req_pool_indices = original_req_pool_indices[
+            torch.tensor(request_indices, device=device, dtype=torch.long)
+        ]
+        req_to_token_pool = forward_batch.req_to_token_pool
 
         input_embeds = torch.cat(talker_input_embeds_list, dim=0)
         positions = torch.cat(
@@ -2194,19 +2176,11 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         extend_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         extend_prefix_lens = torch.zeros_like(extend_seq_lens)
         extend_start_loc = torch.tensor(start_locs, dtype=torch.int32, device=device)
+        for req_idx, kv_locs in zip(req_pool_indices.tolist(), out_cache_loc_chunks):
+            req_to_token_pool.req_to_token[req_idx, : len(kv_locs)] = kv_locs
 
-        max_len = max(seq_lens)
-        talker_req_to_token = torch.zeros(
-            len(request_indices), max_len, dtype=torch.int32, device=device
-        )
-        for i, kv_locs in enumerate(out_cache_loc_chunks):
-            talker_req_to_token[i, : len(kv_locs)] = kv_locs
-
-        forward_batch.override_req_to_token = talker_req_to_token
         forward_batch.batch_size = len(request_indices)
-        forward_batch.req_pool_indices = torch.arange(
-            len(request_indices), device=device, dtype=torch.int32
-        )
+        forward_batch.req_pool_indices = req_pool_indices
         forward_batch.seq_lens = extend_seq_lens
         forward_batch.seq_lens_cpu = extend_seq_lens.cpu()
         forward_batch.seq_lens_sum = sum(seq_lens)
@@ -2392,9 +2366,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
 
         saved_state = self._save_forward_batch_state(forward_batch)
         forward_batch.batch_size = len(request_indices)
-        forward_batch.req_pool_indices = torch.arange(
-            len(request_indices), device=device, dtype=torch.int32
-        )
+        forward_batch.req_pool_indices = saved_state["req_pool_indices"][index_tensor]
         updated_kv_locs_list = self._switch_to_talker_kv_cache_batched(
             forward_batch,
             {"talker_kv_cache_locs_list": talker_kv_locs_subset},
@@ -2605,6 +2577,114 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
             thinker_logits=thinker_logits,
             codec_frames=codec_frames,
             updated_talker_kv_locs_list=updated_kv_locs_list,
+        )
+
+    def _run_talker_mixed_after_graph(
+        self,
+        thinker_logits: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+        model_states: dict,
+        talker_needs_prefill_tensor: torch.Tensor,
+    ) -> ThinkerTalkerOutput:
+        batch_size = forward_batch.batch_size
+        needs_prefill = talker_needs_prefill_tensor.tolist()
+        prefill_indices = [i for i, flag in enumerate(needs_prefill) if flag]
+        decode_indices = [i for i, flag in enumerate(needs_prefill) if not flag]
+
+        codec_frames: List[Optional[List[int]]] = [None] * batch_size
+        talker_out_cache_locs: List[Optional[torch.Tensor]] = [None] * batch_size
+        updated_kv_locs_list: List[Optional[torch.Tensor]] = [None] * batch_size
+        tts_pad_embed_out = None
+
+        if prefill_indices:
+            prefill_frames, tts_pad_embed_out, talker_out_cache_locs = (
+                self._run_talker_prefill_batched_subset(
+                    forward_batch=forward_batch,
+                    model_states=model_states,
+                    request_indices=prefill_indices,
+                )
+            )
+            codec_frames = prefill_frames
+
+        if decode_indices:
+            decode_frames, updated_kv_locs_list = self._run_talker_decode_batched_subset(
+                forward_batch=forward_batch,
+                model_states=model_states,
+                request_indices=decode_indices,
+                positions=forward_batch.positions,
+            )
+            for i, frame in enumerate(decode_frames):
+                if frame is not None:
+                    codec_frames[i] = frame
+
+        return ThinkerTalkerOutput(
+            thinker_logits=thinker_logits,
+            codec_frames=codec_frames,
+            tts_pad_embed=tts_pad_embed_out,
+            talker_out_cache_loc_list=(
+                talker_out_cache_locs
+                if any(kv_locs is not None for kv_locs in talker_out_cache_locs)
+                else None
+            ),
+            updated_talker_kv_locs_list=(
+                updated_kv_locs_list
+                if any(kv_locs is not None for kv_locs in updated_kv_locs_list)
+                else None
+            ),
+        )
+
+    def post_cuda_graph_forward(
+        self,
+        forward_batch: ForwardBatch,
+        thinker_logits: LogitsProcessorOutput,
+    ) -> ThinkerTalkerOutput:
+        model_states = forward_batch.model_specific_states or {}
+        if not model_states:
+            return ThinkerTalkerOutput(thinker_logits=thinker_logits)
+
+        thinker_done_tensor = model_states.get("thinker_done")
+        talker_needs_prefill_tensor = model_states.get("talker_needs_prefill")
+
+        if thinker_done_tensor is not None and thinker_done_tensor.all():
+            talker_only_output = self._forward_talker_only(forward_batch)
+            return ThinkerTalkerOutput(
+                thinker_logits=thinker_logits,
+                codec_frames=talker_only_output.codec_frames,
+                tts_pad_embed=talker_only_output.tts_pad_embed,
+                talker_out_cache_loc_list=talker_only_output.talker_out_cache_loc_list,
+                updated_talker_kv_locs_list=talker_only_output.updated_talker_kv_locs_list,
+            )
+
+        if talker_needs_prefill_tensor is not None and talker_needs_prefill_tensor.any():
+            if talker_needs_prefill_tensor.all():
+                return self._run_talker_prefill_at_decode(
+                    thinker_logits=thinker_logits,
+                    forward_batch=forward_batch,
+                    model_states=model_states,
+                )
+            return self._run_talker_mixed_after_graph(
+                thinker_logits=thinker_logits,
+                forward_batch=forward_batch,
+                model_states=model_states,
+                talker_needs_prefill_tensor=talker_needs_prefill_tensor,
+            )
+
+        request_indices = list(range(forward_batch.batch_size))
+        codec_frames, updated_kv_locs_list = self._run_talker_decode_batched_subset(
+            forward_batch=forward_batch,
+            model_states=model_states,
+            request_indices=request_indices,
+            positions=forward_batch.positions,
+        )
+
+        return ThinkerTalkerOutput(
+            thinker_logits=thinker_logits,
+            codec_frames=codec_frames,
+            updated_talker_kv_locs_list=(
+                updated_kv_locs_list
+                if any(kv_locs is not None for kv_locs in updated_kv_locs_list)
+                else None
+            ),
         )
 
     def _forward_decode_mixed_prefill_decode(
