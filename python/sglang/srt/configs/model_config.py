@@ -771,6 +771,13 @@ class ModelConfig:
         self.hc_hidden_size = self.spec_hidden_size if hc_mult > 1 else None
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
+        if getattr(self.hf_config, "model_type", None) == "qwen3_omni_moe":
+            thinker_layers = self.hf_config.thinker_config.text_config.num_hidden_layers
+            talker_layers = self.hf_config.talker_config.text_config.num_hidden_layers
+            code_pred_layers = (
+                self.hf_config.talker_config.code_predictor_config.num_hidden_layers
+            )
+            self.num_attention_layers = thinker_layers + talker_layers + code_pred_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
             self.num_attention_layers = self.num_hidden_layers * 2
         if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:
@@ -884,6 +891,27 @@ class ModelConfig:
             return max(1, total_num_kv_heads // tensor_parallel_size)
         else:
             return self.get_num_kv_heads(tensor_parallel_size)
+
+    def get_sub_model_kv_configs(self, tensor_parallel_size) -> list[dict]:
+        assert self.hf_config.model_type == "qwen3_omni_moe"
+        configs = []
+        layer_offset = 0
+        components = [
+            ("thinker", self.hf_config.thinker_config.text_config),
+            ("talker", self.hf_config.talker_config.text_config),
+            ("code_predictor", self.hf_config.talker_config.code_predictor_config),
+        ]
+        for name, config in components:
+            num_layers = config.num_hidden_layers
+            configs.append(
+                {
+                    "name": name,
+                    "layer_ids": list(range(layer_offset, layer_offset + num_layers)),
+                    "head_num": max(1, config.num_key_value_heads // tensor_parallel_size),
+                }
+            )
+            layer_offset += num_layers
+        return configs
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):

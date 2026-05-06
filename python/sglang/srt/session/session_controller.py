@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
@@ -94,6 +94,7 @@ class Session:
         self.req_nodes: Dict[str, SessionReqNode] = {}
         self.close_on_finish: bool = False
         self._inflight: bool = False
+        self.component_kv: Dict[str, Any] = {}
 
     def is_timed_out(self) -> bool:
         if self.timeout is None:
@@ -247,13 +248,22 @@ class Session:
         if abort:
             new_req.set_finish_with_abort(abort_message)
         elif self.streaming:
-            # req_nodes is NOT updated here — finish_req() handles it.
-            self._inflight = True
+            # req_nodes is NOT updated here; finish_req() handles it.
+            self.attach_req(new_req)
         else:
             new_req_node = SessionReqNode(new_req, last_req_node)
             self.req_nodes[req.rid] = new_req_node
 
         return new_req
+
+    def attach_req(self, req: Req) -> None:
+        assert self.streaming
+        assert not self._inflight, (
+            f"streaming session {self.session_id} already has an active request"
+        )
+        self._inflight = True
+        self.last_active_time = time.monotonic()
+        req.session = self
 
     def finish_req(self, req):
         """Update req_nodes after a streaming request finishes successfully."""
@@ -267,6 +277,30 @@ class Session:
     def abort_req(self):
         """Clear inflight flag on abort (req_nodes stays unchanged)."""
         self._inflight = False
+
+    def latest_req(self) -> Optional[Req]:
+        assert self.streaming
+        assert len(self.req_nodes) <= 1, (
+            f"streaming session {self.session_id} has "
+            f"{len(self.req_nodes)} committed requests"
+        )
+        if not self.req_nodes:
+            return None
+        [node] = self.req_nodes.values()
+        return node.req
+
+    def get_component_kv(self, name: str) -> Any:
+        return self.component_kv.get(name)
+
+    def set_component_kv(self, name: str, value: Any) -> None:
+        assert name not in self.component_kv, (
+            f"streaming session {self.session_id} already has component KV "
+            f"state for {name}"
+        )
+        self.component_kv[name] = value
+
+    def pop_component_kv(self, name: str) -> Any:
+        return self.component_kv.pop(name, None)
 
 
 class SessionController:
@@ -335,9 +369,13 @@ class SessionController:
             return
 
         # No owning request -- safe to release immediately.
-        if session.streaming and session.req_nodes:
-            req = next(iter(session.req_nodes.values())).req
+        if session.streaming and (req := session.latest_req()) is not None:
             req.session = None
+
+        assert not session.component_kv, (
+            f"streaming session {session_id} still owns component KV state "
+            f"for {sorted(session.component_kv)}"
+        )
 
         # Release multimodal features held by session requests.
         # Session reqs skip the normal mm cleanup path (scheduler and

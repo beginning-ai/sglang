@@ -11,8 +11,11 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _FakeAllocator:
-    def __init__(self):
+    def __init__(self, page_size=None):
         self.freed = []
+        self.is_not_in_free_group = True
+        if page_size is not None:
+            self.page_size = page_size
 
     def free(self, free_index: torch.Tensor):
         self.freed.append(free_index.clone())
@@ -242,6 +245,90 @@ def test_trim_overshoot_postcondition():
     # Tail [38, 44) freed by _free_kv_aligned.
     assert len(allocator.freed) == 1
     assert allocator.freed[0].tolist() == list(range(38, 44))
+
+
+def test_session_held_tokens_uses_allocator_page_size():
+    req_to_token = torch.arange(2048, dtype=torch.int32).reshape(1, 2048)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator(page_size=64)
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=1416,
+        kv_allocated_len=1416,
+        cache_protected_len=1328,
+    )
+
+    assert tree_cache.session_held_tokens() == 144
+
+
+def test_trim_overshoot_preserves_live_partial_page():
+    req_to_token = torch.arange(2048, dtype=torch.int32).reshape(1, 2048)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator(page_size=64)
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    )
+    req = _FakeReq("session-a", req_pool_idx=0, committed=1472, allocated=1472)
+    req.origin_input_ids = list(range(1328))
+    req.output_ids = list(range(100))
+
+    tree_cache._trim_overshoot(req, finished_len=87)
+
+    assert req.kv_committed_len == 1415
+    assert req.kv_allocated_len == 1472
+    assert allocator.freed == []
+
+
+def test_trim_overshoot_keeps_tail_owned_during_allocator_free_group():
+    req_to_token = torch.arange(2048, dtype=torch.int32).reshape(1, 2048)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator(page_size=1)
+    allocator.is_not_in_free_group = False
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    )
+    req = _FakeReq("session-a", req_pool_idx=0, committed=1474, allocated=1474)
+    req.origin_input_ids = list(range(1328))
+    req.output_ids = list(range(100))
+
+    tree_cache._trim_overshoot(req, finished_len=89)
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=req.req_pool_idx,
+        kv_committed_len=req.kv_committed_len,
+        kv_allocated_len=req.kv_allocated_len,
+        cache_protected_len=1328,
+    )
+
+    assert req.kv_committed_len == 1417
+    assert req.kv_allocated_len == 1474
+    assert allocator.freed == []
+    assert tree_cache.session_held_tokens() == 146
+
+
+def test_chunked_streaming_cache_moves_kv_into_session_slot():
+    req_to_token = torch.arange(2048, dtype=torch.int32).reshape(1, 2048)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator(page_size=1)
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    )
+    req = _FakeReq("session-a", req_pool_idx=0, committed=1472, allocated=1472)
+    req.fill_ids = list(range(1472))
+    req.cache_protected_len = 1328
+
+    assert tree_cache.try_cache_unfinished_req(req, chunked=True)
+
+    slot = tree_cache.slots["session-a"]
+    assert slot.req_pool_idx == 0
+    assert slot.kv_committed_len == 1472
+    assert slot.kv_allocated_len == 1472
+    assert slot.cache_protected_len == 1328
+    assert req.req_pool_idx is None
+    assert len(req.prefix_indices) == 1472
+    assert tree_cache.session_held_tokens() == 144
 
 
 if __name__ == "__main__":

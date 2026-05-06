@@ -2958,8 +2958,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        talker_only_decode = self._is_qwen3_omni_talker_only_decode(forward_batch)
         # Set extra arguments
-        if not skip_attn_backend_init:
+        if not skip_attn_backend_init and not talker_only_decode:
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
@@ -2987,6 +2988,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch,
                 **kwargs,
             )
+
+    @staticmethod
+    def _is_qwen3_omni_talker_only_decode(forward_batch: ForwardBatch) -> bool:
+        if not forward_batch.forward_mode.is_decode():
+            return False
+        if forward_batch.out_cache_loc is not None:
+            return False
+        model_states = forward_batch.model_specific_states or {}
+        thinker_done = model_states.get("thinker_done")
+        return thinker_done is not None and thinker_done.all()
 
     def forward_extend(
         self,
@@ -3205,6 +3216,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         can_run_graph = bool(
             mode_check()
             and self.graph_runner
+            and not self._is_qwen3_omni_talker_only_decode(forward_batch)
             and self.graph_runner.can_run(forward_batch)
         )
 
@@ -3224,6 +3236,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if hasattr(self.model, "post_cuda_graph_forward") and self.pp_group.is_last_rank:
+                ret = self.model.post_cuda_graph_forward(forward_batch, ret)
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync
@@ -3315,6 +3329,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Returns:
             A list of next_token_ids
         """
+        if hasattr(logits_output, "thinker_logits"):
+            if logits_output.thinker_logits is None:
+                return torch.zeros(
+                    forward_batch.batch_size, dtype=torch.long, device=self.device
+                )
+            logits_output = logits_output.thinker_logits
+
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Sample the next tokens

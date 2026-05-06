@@ -39,6 +39,7 @@ class MemoryPoolConfig:
     max_running_requests: Optional[int] = None
     full_max_total_num_tokens: Optional[int] = None
     swa_max_total_num_tokens: Optional[int] = None
+    sub_model_max_total_num_tokens: Optional[dict[str, int]] = None
 
     # DSV4 compressed-attention pool sizes (target only; draft workers leave at 0).
     c4_max_total_num_tokens: int = 0
@@ -461,6 +462,117 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return self._to_config(sizes)
 
 
+class SubModelPoolConfigurator(MemoryPoolConfigurator):
+    """Configurator for models with independent KV pools per sub-model."""
+
+    _QWEN3_OMNI_KV_MEMORY_FRACTIONS = {
+        "thinker": 0.90,
+        "talker": 0.10,
+    }
+
+    def __init__(self, mr: ModelRunner):
+        model_config = mr.model_config
+        if mr.server_args.qwen3_omni_max_concurrent_audio_turns is None:
+            raise RuntimeError(
+                "Qwen3-Omni audio serving requires "
+                "--qwen3-omni-max-concurrent-audio-turns so component KV pools "
+                "are sized from the launch capacity."
+            )
+        kv_size = torch._utils._element_size(mr.kv_cache_dtype)
+        self._configs = model_config.get_sub_model_kv_configs(get_attention_tp_size())
+        self._cell_sizes = {
+            config["name"]: (
+                config["head_num"]
+                * (model_config.head_dim + model_config.v_head_dim)
+                * len(config["layer_ids"])
+                * kv_size
+            )
+            for config in self._configs
+        }
+        if [config["name"] for config in self._configs] != [
+            "thinker",
+            "talker",
+            "code_predictor",
+        ]:
+            raise RuntimeError(
+                "Qwen3-Omni sub-model KV pool order must be thinker,talker,code_predictor"
+            )
+        self._memory_fractions = self._QWEN3_OMNI_KV_MEMORY_FRACTIONS
+        code_predictor_config = (
+            model_config.hf_config.talker_config.code_predictor_config
+        )
+        self._fixed_code_predictor_tokens = (
+            mr.server_args.qwen3_omni_max_concurrent_audio_turns
+            * code_predictor_config.num_code_groups
+        )
+        self._primary_name = self._configs[0]["name"]
+
+    def _align(self, num_tokens: int, page_size: int) -> int:
+        return num_tokens // page_size * page_size
+
+    def _align_up(self, num_tokens: int, page_size: int) -> int:
+        return ((num_tokens + page_size - 1) // page_size) * page_size
+
+    def _solve_from_available_bytes(
+        self, available_bytes: int, page_size: int
+    ) -> MemoryPoolConfig:
+        code_predictor_tokens = self._align_up(
+            self._fixed_code_predictor_tokens,
+            page_size,
+        )
+        code_predictor_bytes = (
+            code_predictor_tokens * self._cell_sizes["code_predictor"]
+        )
+        remaining_bytes = available_bytes - code_predictor_bytes
+        if remaining_bytes <= 0:
+            raise RuntimeError(
+                "Qwen3-Omni CodePredictor fixed KV reservation does not fit: "
+                f"tokens={code_predictor_tokens}, bytes={code_predictor_bytes}, "
+                f"available_bytes={available_bytes}."
+            )
+        sizes = {
+            name: self._align(
+                int(remaining_bytes * fraction // self._cell_sizes[name]),
+                page_size,
+            )
+            for name, fraction in self._memory_fractions.items()
+        }
+        sizes["code_predictor"] = code_predictor_tokens
+        logger.info(
+            "Use sub-model KV pools. token sizes=%s, fixed_code_predictor_tokens=%s",
+            sizes,
+            code_predictor_tokens,
+        )
+        return MemoryPoolConfig(
+            max_total_num_tokens=sizes[self._primary_name],
+            sub_model_max_total_num_tokens=sizes,
+        )
+
+    def calculate_pool_sizes(
+        self, available_bytes: int, page_size: int
+    ) -> MemoryPoolConfig:
+        return self._solve_from_available_bytes(available_bytes, page_size)
+
+    def calculate_pool_sizes_from_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> MemoryPoolConfig:
+        primary_fraction = self._memory_fractions[self._primary_name]
+        primary_cell_size = self._cell_sizes[self._primary_name]
+        code_predictor_tokens = self._align_up(
+            self._fixed_code_predictor_tokens,
+            page_size,
+        )
+        code_predictor_bytes = (
+            code_predictor_tokens * self._cell_sizes["code_predictor"]
+        )
+        available_bytes = (
+            int(max_total_num_tokens * primary_cell_size / primary_fraction)
+            + code_predictor_bytes
+        )
+        return self._solve_from_available_bytes(available_bytes, page_size)
+
+
+
 def create_memory_pool_configurator(
     mr: ModelRunner,
 ) -> MemoryPoolConfigurator:
@@ -469,5 +581,4 @@ def create_memory_pool_configurator(
         return DSV4PoolConfigurator(mr)
     if mr.is_hybrid_swa:
         return HybridSWAPoolConfigurator(mr)
-    # Future: MambaPoolConfigurator
-    return DefaultPoolConfigurator(mr)
+    return SubModelPoolConfigurator(mr)

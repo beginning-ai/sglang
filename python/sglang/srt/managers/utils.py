@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 from dataclasses import dataclass
+import time
 from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import torch
@@ -12,7 +13,12 @@ from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_qwen3_omni_mixin import (
+        Qwen3OmniAudioReadyState,
+    )
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 
@@ -22,6 +28,64 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass(frozen=True)
+class Qwen3OmniTalkerPrefillPayload:
+    origin_input_ids: List[torch.Tensor]
+    origin_input_ids_cpu: List[List[int]]
+    multimodal_inputs: Any
+    prev_sampled_thinker_token: torch.Tensor
+    prompt_accept_hidden_states: Optional[List[torch.Tensor]]
+    tts_pad_embed: Optional[torch.Tensor]
+    codec_eos_token_id: int
+    talker_temperature: Any
+    talker_top_k: Any
+    talker_top_p: Any
+    talker_repetition_penalty: Any
+    talker_prev_codec_tokens: Optional[List[List[int]]]
+    speakers: Optional[List[str]]
+    talker_kv_cache_locs_list: List[Optional[torch.Tensor]]
+    talker_prefill_input_ids_list: List[Optional[torch.Tensor]]
+    sample_codec: bool = True
+
+
+@dataclasses.dataclass(frozen=True)
+class Qwen3OmniTalkerDecodePayload:
+    prev_codec_id: torch.Tensor
+    prev_residual_codes: torch.Tensor
+    prev_codec_input_embeds: torch.Tensor
+    talker_positions: torch.Tensor
+    talker_kv_cache_locs_list: List[Optional[torch.Tensor]]
+    thinker_done: Optional[torch.Tensor]
+    talker_post_thinker_started: Optional[torch.Tensor]
+    talker_has_text_lag: Optional[torch.Tensor]
+    talker_needs_tts_eos: Optional[torch.Tensor]
+    tts_pad_embed: Optional[torch.Tensor]
+    prev_sampled_thinker_token: Optional[torch.Tensor]
+    codec_eos_token_id: int
+    talker_temperature: Any
+    talker_top_k: Any
+    talker_top_p: Any
+    talker_repetition_penalty: Any
+    talker_prev_codec_tokens: Optional[List[List[int]]]
+    talker_sampler_seed: torch.Tensor
+    talker_sampler_step: torch.Tensor
+    talker_repetition_mask: Optional[List[Optional[torch.Tensor]]] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Qwen3OmniCodePredictorPayload:
+    request_indices: List[int]
+    input_embeds: torch.Tensor
+    codec_tokens: torch.Tensor
+
+
+Qwen3OmniAudioPhasePayload = Union[
+    Qwen3OmniTalkerPrefillPayload,
+    Qwen3OmniTalkerDecodePayload,
+    Qwen3OmniCodePredictorPayload,
+]
 
 
 @dataclasses.dataclass
@@ -36,6 +100,7 @@ class GenerationBatchResult:
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None
     extend_logprob_start_len_per_req: Optional[List[int]] = None
+    qwen3_omni_audio_forward_batch: Optional[ForwardBatch] = None
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
@@ -131,6 +196,23 @@ class GenerationBatchResult:
             ),
             can_run_cuda_graph=can_run_cuda_graph,
         )
+
+
+@dataclasses.dataclass
+class Qwen3OmniAudioPhaseItem:
+    logits_output: Any
+    forward_batch: ForwardBatch
+    next_token_ids: Union[torch.Tensor, List[torch.Tensor]]
+    reqs: List[Req]
+    return_logprob: bool
+    phase: str
+    request_indices: List[int]
+    request_rids: List[str]
+    payload: Qwen3OmniAudioPhasePayload
+    ready_states: List[Qwen3OmniAudioReadyState] = dataclasses.field(
+        default_factory=list
+    )
+    queued_at: float = dataclasses.field(default_factory=time.perf_counter)
 
 
 def validate_input_length(

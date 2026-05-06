@@ -163,6 +163,14 @@ def get_rope(
             )
         elif scaling_type == "default":
             if "mrope_section" in rope_scaling:
+                # Qwen3-Omni Talker config uses `interleaved` (without the
+                # `mrope_` prefix); the Thinker also adds `mrope_interleaved`.
+                # HF applies interleaved unconditionally for both. Honor either
+                # spelling so the talker doesn't silently fall back to chunked.
+                _mrope_il = rope_scaling.get(
+                    "mrope_interleaved",
+                    rope_scaling.get("interleaved", False),
+                )
                 rotary_emb = MRotaryEmbedding(
                     head_size,
                     rotary_dim,
@@ -171,7 +179,7 @@ def get_rope(
                     is_neox_style,
                     dtype,
                     mrope_section=rope_scaling["mrope_section"],
-                    mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
+                    mrope_interleaved=_mrope_il,
                     mrope_interleaved_glm=rope_scaling.get(
                         "mrope_interleaved_glm", False
                     ),

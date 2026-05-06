@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     List,
     Optional,
@@ -60,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
+    scheduler: Any = None
     is_generation: bool
     disaggregation_mode: "DisaggregationMode"
     enable_overlap: bool
@@ -177,6 +179,9 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if self.scheduler is not None and self.scheduler._is_qwen3_omni_batch(batch):
+            return self.scheduler.process_batch_result_prefill(batch, result)
+
         skip_stream_req = None
 
         if self.is_generation:
@@ -532,6 +537,9 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        if self.scheduler is not None and self.scheduler._is_qwen3_omni_batch(batch):
+            return self.scheduler.process_batch_result_idle(batch, result)
+
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
@@ -544,6 +552,9 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        if self.scheduler is not None and self.scheduler._is_qwen3_omni_batch(batch):
+            return self.scheduler.process_batch_result_decode(batch, result)
+
         if result.copy_done is not None:
             result.copy_done.synchronize()
         if result.routed_experts_output is not None:

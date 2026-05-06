@@ -33,8 +33,11 @@ ScheduleBatch -> ForwardBatch
 
 import copy
 import dataclasses
+import hashlib
 import logging
+import os
 import re
+from collections import deque
 from concurrent.futures import Future
 from enum import Enum, auto
 from functools import lru_cache
@@ -121,6 +124,14 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
+
+AUDIO_MAX_TEXT_LAG = 8
+AUDIO_CODE2WAV_CHUNK_FRAMES = 4
+AUDIO_MAX_AUDIO_FRAME_LAG = AUDIO_CODE2WAV_CHUNK_FRAMES * 4
+# Small enough to preserve first-audio latency while still coalescing
+# multi-user streaming-prefill/audio-lane work at the launch bs=50 shape.
+AUDIO_BATCH_DELAY_MS = 20
+AUDIO_DEFAULT_TALKER_MAX_NEW_TOKENS = 4096
 
 
 @lru_cache(maxsize=1)
@@ -647,6 +658,7 @@ class Req(ReqDllmMixin):
         ] = None,
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
+        codec_eos_token_id: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -932,6 +944,64 @@ class Req(ReqDllmMixin):
         # For hisparse
         self.hisparse_staging = False
 
+        # Qwen3-Omni audio input turn state. These fields are deliberately
+        # limited to request lifecycle/scheduling; Talker/MTP/Code2Wav phase
+        # state is introduced separately by the async audio scheduler.
+        self.is_audio_input_stream: bool = False
+        self.audio_input_done: bool = True
+        self.audio_input_suffix_added: bool = False
+        self.audio_input_chunk_idx: int = 0
+        self.audio_input_prefill_inflight: bool = False
+        self.qwen3_omni_stream_prefill_ready_at: float = 0.0
+        self.qwen3_omni_partial_talker_prefill_chunk_idx: int = 0
+        self.audio_session_id: Optional[str] = None
+        self.speaker: Optional[str] = None
+
+        # Qwen3-Omni audio-output state.
+        from sglang.srt.managers.scheduler_qwen3_omni_mixin import (
+            Qwen3OmniAudioPhase,
+        )
+
+        self.codec_eos_token_id: Optional[int] = codec_eos_token_id
+        self.qwen3_omni_audio_phase: Optional[Qwen3OmniAudioPhase] = (
+            Qwen3OmniAudioPhase.THINKER_RUNNING
+            if codec_eos_token_id is not None
+            else None
+        )
+        self.qwen3_omni_audio_ready_state: Optional[Qwen3OmniAudioReadyState] = None
+        self.qwen3_omni_audio_ready_states: List[Qwen3OmniAudioReadyState] = []
+        self.qwen3_omni_text_lag_tokens: deque[int] = deque()
+        self.qwen3_omni_tts_eos_pending: bool = False
+        self.qwen3_omni_audio_frame_lag: int = 0
+        self.thinker_done: bool = False
+        self.qwen3_omni_talker_post_thinker_started: bool = False
+        self.talker_step: int = 0
+        self.talker_needs_prefill: bool = False
+        self.prev_sampled_thinker_token: Optional[int] = None
+        self.qwen3_omni_prompt_accept_hidden: Optional[torch.Tensor] = None
+        self.tts_pad_embed: Optional[torch.Tensor] = None
+        self.prev_residual_codes: Optional[List[int]] = None
+        self.prev_codec_input_embed: Optional[torch.Tensor] = None
+        self.talker_codec_ids: List[int] = []
+        self.talker_repetition_mask: Optional[torch.Tensor] = None
+        self.talker_sampler_seed: int = int.from_bytes(
+            hashlib.blake2s(str(rid).encode("utf-8"), digest_size=8).digest(),
+            "little",
+        ) & 0x7FFFFFFF
+        self.talker_output_codes: List[List[int]] = []
+        self.talker_kv_cache_locs: Optional[torch.Tensor] = None
+        self.talker_prefill_len: int = 0
+        self.talker_user_prefill_len: int = 0
+        self.talker_prefill_input_ids: Optional[torch.Tensor] = None
+        self.talker_mrope_position_delta: Optional[int] = None
+        self.talker_pcm16_chunks: List[bytes] = []
+        self.talker_last_decoded_frame: int = 0
+        self.talker_pcm16_chunk_cap: int = 1000
+        self.qwen3_omni_code2wav_pending: bool = False
+        self.qwen3_omni_rebuild_request: bool = False
+        self.qwen3_omni_rebuild_response_rid: Optional[str] = None
+        self.qwen3_omni_rebuild_turn_count: int = 0
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -1051,25 +1121,74 @@ class Req(ReqDllmMixin):
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
                 match_result = zero_match_result(tree_cache, match_result)
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.best_match_node,
-                self.host_hit_length,
-                self.mamba_branching_seqlen,
-            ) = (
-                match_result.device_indices,
-                match_result.last_device_node,
-                match_result.last_host_node,
-                match_result.best_match_node,
-                match_result.host_hit_length,
-                match_result.mamba_branching_seqlen,
-            )
-            if match_result.cache_protected_len is not None:
-                self.cache_protected_len = match_result.cache_protected_len
-            else:
-                self.cache_protected_len = len(self.prefix_indices)
+            # Preserve in-progress chunked-prefill prefix_indices when the
+            # tree_cache has nothing to match against. This matters for
+            # Qwen3-Omni audio chunked prefill (and any other chunked prefill
+            # under ChunkCache), where the request bounces through the waiting
+            # queue between chunks. ChunkCache.match_prefix always returns
+            # empty, so without this guard the KV slots referenced by
+            # prefix_indices become orphaned and leak ~system-prompt-length
+            # KV tokens per request. Only override when the cache actually
+            # found a longer (or equal) match.
+            if (
+                len(match_result.device_indices) > 0
+                or len(self.prefix_indices) == 0
+            ):
+                # If a cache hit covers any multimodal placeholder tokens but
+                # the current request has no accept_hidden for those cached
+                # tokens (different request than the one that filled the
+                # cache), the talker prefill cannot synthesize audio for the
+                # cached portion. Truncate the match to before the first
+                # multimodal token so the multimodal segment is re-prefilled
+                # fresh while the text-only prefix can still benefit from
+                # caching. (Same-request reuse keeps accept_hidden via
+                # qwen3_omni_prompt_accept_hidden, so it's unaffected.)
+                if (
+                    len(match_result.device_indices) > 0
+                    and self.qwen3_omni_prompt_accept_hidden is None
+                ):
+                    matched_len = len(match_result.device_indices)
+                    matched_tids = self.fill_ids[:matched_len]
+                    mm_idx = next(
+                        (
+                            i
+                            for i, t in enumerate(matched_tids)
+                            if t >= MM_PAD_SHIFT_VALUE
+                        ),
+                        -1,
+                    )
+                    if mm_idx >= 0:
+                        truncated_key = RadixKey(
+                            token_ids=token_ids_to_match[:mm_idx],
+                            extra_key=self.extra_key,
+                        )
+                        match_result = tree_cache.match_prefix(
+                            MatchPrefixParams(
+                                key=truncated_key,
+                                req=self,
+                                cow_mamba=cow_mamba,
+                            )
+                        )
+
+                (
+                    self.prefix_indices,
+                    self.last_node,
+                    self.last_host_node,
+                    self.best_match_node,
+                    self.host_hit_length,
+                    self.mamba_branching_seqlen,
+                ) = (
+                    match_result.device_indices,
+                    match_result.last_device_node,
+                    match_result.last_host_node,
+                    match_result.best_match_node,
+                    match_result.host_hit_length,
+                    match_result.mamba_branching_seqlen,
+                )
+                if match_result.cache_protected_len is not None:
+                    self.cache_protected_len = match_result.cache_protected_len
+                else:
+                    self.cache_protected_len = len(self.prefix_indices)
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1238,19 +1357,45 @@ class Req(ReqDllmMixin):
             self.to_finish = None
             return
 
-        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
+        if (
+            self.codec_eos_token_id is not None
+            and not self.thinker_done
+            and len(self.output_ids) >= self.sampling_params.max_new_tokens
+        ):
+            self.thinker_done = True
+            self.qwen3_omni_tts_eos_pending = True
+            return
+
+        if (
+            self.codec_eos_token_id is None
+            and len(self.output_ids) >= self.sampling_params.max_new_tokens
+        ):
             self.finished_reason = FINISH_LENGTH(
                 length=self.sampling_params.max_new_tokens
             )
             self.finished_len = self.sampling_params.max_new_tokens
             return
 
-        if self.grammar is not None:
-            if self.grammar.is_terminated():
+        new_accepted_tokens = self.output_ids[-new_accepted_len:]
+
+        from sglang.srt.managers.scheduler_qwen3_omni_mixin import (
+            check_qwen3_omni_finish,
+        )
+
+        if self.grammar is not None and self.grammar.is_terminated():
+            if self.codec_eos_token_id is not None:
+                if not self.thinker_done:
+                    self.thinker_done = True
+                    self.qwen3_omni_tts_eos_pending = True
+                    return
+                if check_qwen3_omni_finish(self, new_accepted_tokens):
+                    return
+            else:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
                 return
 
-        new_accepted_tokens = self.output_ids[-new_accepted_len:]
+        if check_qwen3_omni_finish(self, new_accepted_tokens):
+            return
 
         if self._check_token_based_finish(new_accepted_tokens):
             return
@@ -1289,6 +1434,19 @@ class Req(ReqDllmMixin):
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
         self.already_computed = 0
+        self.talker_kv_cache_locs = None
+        self.qwen3_omni_text_lag_tokens.clear()
+        self.qwen3_omni_tts_eos_pending = False
+        self.qwen3_omni_audio_frame_lag = 0
+        self.qwen3_omni_audio_ready_state = None
+        self.qwen3_omni_audio_ready_states.clear()
+        self.qwen3_omni_code2wav_pending = False
+        if self.codec_eos_token_id is not None:
+            from sglang.srt.managers.scheduler_qwen3_omni_mixin import (
+                Qwen3OmniAudioPhase,
+            )
+
+            self.qwen3_omni_audio_phase = Qwen3OmniAudioPhase.THINKER_RUNNING
         self.kv_allocated_len = 0
         self.kv_committed_len = 0
         self.kv_committed_freed = False
@@ -2354,9 +2512,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
-        # Decode embeds the last output token via embed_tokens; clear the stale
-        # prefill-time tensor so it doesn't leak into ForwardBatch.
+        # Decode embeds the last output token via embed_tokens; clear stale
+        # prefill-time embedding overrides so they do not disable graph replay.
         self.input_embeds = None
+        self.replace_embeds = None
+        self.replace_positions = None
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
@@ -2405,29 +2565,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
-        # Allocate memory
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
-
-        # Update req-level memory management fields
         for req in self.reqs:
             req.decode_batch_idx += 1
-            req.kv_committed_len += 1
-            req.kv_allocated_len += 1
 
-        # Update seq_lens after allocation
-        if self.enable_overlap:
-            # Do not use in-place operations in the overlap mode
-            self.seq_lens = self.seq_lens + 1
-            self.seq_lens_cpu = self.seq_lens_cpu + 1
-            self.orig_seq_lens = self.orig_seq_lens + 1
+        if all(req.thinker_done for req in self.reqs):
+            self.out_cache_loc = None
         else:
-            # A faster in-place version
-            self.seq_lens.add_(1)
-            self.seq_lens_cpu.add_(1)
-            self.orig_seq_lens.add_(1)
-        self.seq_lens_sum += bs
+            # Allocate memory
+            self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
-        if self.hisparse_coordinator is not None:
+            # Update req-level memory management fields
+            for req in self.reqs:
+                req.kv_committed_len += 1
+                req.kv_allocated_len += 1
+
+            # Update seq_lens after allocation
+            if self.enable_overlap:
+                # Do not use in-place operations in the overlap mode
+                self.seq_lens = self.seq_lens + 1
+                self.seq_lens_cpu = self.seq_lens_cpu + 1
+                self.orig_seq_lens = self.orig_seq_lens + 1
+            else:
+                # A faster in-place version
+                self.seq_lens.add_(1)
+                self.seq_lens_cpu.add_(1)
+                self.orig_seq_lens.add_(1)
+            self.seq_lens_sum += bs
+
+        if self.hisparse_coordinator is not None and self.out_cache_loc is not None:
             self.hisparse_coordinator.map_last_loc_to_buffer(
                 self.seq_lens,
                 self.out_cache_loc,

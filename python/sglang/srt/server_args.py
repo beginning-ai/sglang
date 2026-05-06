@@ -402,6 +402,7 @@ class ServerArgs:
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
     swa_full_tokens_ratio: float = 0.8
+    qwen3_omni_max_concurrent_audio_turns: Optional[int] = None
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
     enable_prefill_delayer: bool = False
@@ -3913,6 +3914,11 @@ class ServerArgs:
 
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+        if (
+            self.qwen3_omni_max_concurrent_audio_turns is not None
+            and self.qwen3_omni_max_concurrent_audio_turns <= 0
+        ):
+            raise ValueError("--qwen3-omni-max-concurrent-audio-turns must be positive.")
 
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
@@ -4585,6 +4591,13 @@ class ServerArgs:
             default=ServerArgs.swa_full_tokens_ratio,
             help="The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. "
             "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.",
+        )
+        parser.add_argument(
+            "--qwen3-omni-max-concurrent-audio-turns",
+            type=int,
+            default=ServerArgs.qwen3_omni_max_concurrent_audio_turns,
+            help="Maximum concurrent Qwen3-Omni realtime audio turns. "
+            "Also derives fixed CodePredictor KV scratch sizing.",
         )
         parser.add_argument(
             "--disable-hybrid-swa-memory",

@@ -260,6 +260,7 @@ inputs/
 # setuptools-scm generated version file
 python/sglang/_version.py
 python/kernel.lock
+python/uv.lock
 
 # MUSA section
 # Generated source files by torchada
@@ -276,4 +277,5 @@ sgl-kernel/csrc/**/*_musa/
 *.ply
 *.npz
 artifacts/
-.claude/scheduled_tasks.lock
+.claude/
+perf_baselines/

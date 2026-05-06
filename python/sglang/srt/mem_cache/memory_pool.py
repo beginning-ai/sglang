@@ -29,7 +29,7 @@ import dataclasses
 import logging
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -1374,6 +1374,119 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
             self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
+
+
+class HybridMultiHeadKVPool(KVCache):
+    """KV cache with separate pools for sub-models with different KV head counts."""
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_dim: int,
+        sub_model_configs: List[dict],
+        device: str,
+        enable_memory_saver: bool = False,
+    ):
+        self.size = size
+        self.page_size = page_size
+        self.dtype = dtype
+        self.head_dim = head_dim
+        self.device = device
+        self.enable_memory_saver = enable_memory_saver
+        self.sub_model_configs = sub_model_configs
+
+        self.pools: List[MHATokenToKVPool] = []
+        self.pools_by_name: dict[str, MHATokenToKVPool] = {}
+        self.sizes_by_name: dict[str, int] = {}
+        self.layer_to_pool_mapping: Dict[int, Tuple[int, int]] = {}
+
+        for pool_idx, config in enumerate(sub_model_configs):
+            name = config["name"]
+            layer_ids = config["layer_ids"]
+            pool = MHATokenToKVPool(
+                size=config["size"],
+                page_size=page_size,
+                dtype=dtype,
+                head_num=config["head_num"],
+                head_dim=head_dim,
+                layer_num=len(layer_ids),
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+            )
+            self.pools.append(pool)
+            self.pools_by_name[name] = pool
+            self.sizes_by_name[name] = config["size"]
+
+            for local_idx, global_layer_id in enumerate(layer_ids):
+                self.layer_to_pool_mapping[global_layer_id] = (pool_idx, local_idx)
+
+        total_k_size = sum(pool.get_kv_size_bytes()[0] for pool in self.pools)
+        total_v_size = sum(pool.get_kv_size_bytes()[1] for pool in self.pools)
+        self.mem_usage = (total_k_size + total_v_size) / GB
+
+    def _get_pool_and_local_id(self, layer_id: int) -> Tuple[MHATokenToKVPool, int]:
+        if layer_id not in self.layer_to_pool_mapping:
+            raise ValueError(
+                f"layer_id {layer_id} not found in layer_to_pool_mapping. "
+                f"Available layer IDs: {list(self.layer_to_pool_mapping.keys())}"
+            )
+        pool_idx, local_layer_id = self.layer_to_pool_mapping[layer_id]
+        return self.pools[pool_idx], local_layer_id
+
+    def get_kv_size_bytes(self):
+        total_k = sum(pool.get_kv_size_bytes()[0] for pool in self.pools)
+        total_v = sum(pool.get_kv_size_bytes()[1] for pool in self.pools)
+        return total_k, total_v
+
+    def get_contiguous_buf_infos(self):
+        all_data_ptrs = []
+        all_data_lens = []
+        all_item_lens = []
+        for pool in self.pools:
+            ptrs, lens, items = pool.get_contiguous_buf_infos()
+            all_data_ptrs.extend(ptrs)
+            all_data_lens.extend(lens)
+            all_item_lens.extend(items)
+        return all_data_ptrs, all_data_lens, all_item_lens
+
+    def maybe_get_custom_mem_pool(self):
+        return self.pools[0].maybe_get_custom_mem_pool() if self.pools else None
+
+    def get_key_buffer(self, layer_id: int):
+        pool, local_id = self._get_pool_and_local_id(layer_id)
+        return pool.get_key_buffer(local_id)
+
+    def get_value_buffer(self, layer_id: int):
+        pool, local_id = self._get_pool_and_local_id(layer_id)
+        return pool.get_value_buffer(local_id)
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+    ):
+        pool, local_id = self._get_pool_and_local_id(layer.layer_id)
+        pool.set_kv_buffer(
+            layer,
+            loc,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            layer_id_override=local_id,
+        )
+
+    def get_v_head_dim(self):
+        return self.pools[0].get_value_buffer(0).shape[-1] if self.pools else self.head_dim
 
 
 class HybridLinearKVPool(KVCache):

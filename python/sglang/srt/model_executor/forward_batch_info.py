@@ -374,6 +374,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Attention backend
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool: KVCache = None
+    override_req_to_token: Optional[torch.Tensor] = None
+    qwen3_omni_token_to_kv_pool_allocators: Optional[Dict[str, object]] = None
     attn_backend: AttentionBackend = None
 
     # For DP attention
@@ -537,6 +539,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
+            qwen3_omni_token_to_kv_pool_allocators=(
+                model_runner.qwen3_omni_token_to_kv_pool_allocators
+            ),
             attn_backend=model_runner.attn_backend,
             spec_algorithm=batch.spec_algorithm,
             spec_info=batch.spec_info,
@@ -669,6 +674,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
+        if batch.reqs:
+            ret._init_qwen3_omni_states(batch, model_runner.device)
+            if any(req.codec_eos_token_id is not None for req in batch.reqs):
+                ret.model_specific_states = ret.model_specific_states or {}
+                ret.model_specific_states["qwen3_omni_voice_batch"] = torch.tensor(
+                    [req.codec_eos_token_id is not None for req in batch.reqs],
+                    dtype=torch.bool,
+                    device=model_runner.device,
+                )
+            if batch.forward_mode.is_extend():
+                ret.model_specific_states = ret.model_specific_states or {}
+                ret.model_specific_states["origin_input_ids"] = [
+                    torch.tensor(req.origin_input_ids, device=model_runner.device, dtype=torch.long)
+                    for req in batch.reqs
+                ]
+                ret.model_specific_states["origin_input_ids_cpu"] = [
+                    list(req.origin_input_ids) for req in batch.reqs
+                ]
+
         return ret
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
@@ -755,6 +779,204 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_lens=req_lens,
         )
 
+    def _init_qwen3_omni_states(
+        self, batch: ModelWorkerBatch, device: torch.device
+    ) -> None:
+        reqs = batch.reqs
+        if not any(
+            req.talker_needs_prefill
+            or req.talker_codec_ids
+            or req.qwen3_omni_prompt_accept_hidden is not None
+            for req in reqs
+        ):
+            return
+
+        codec_eos_token_id = next(
+            (req.codec_eos_token_id for req in reqs if req.codec_eos_token_id is not None),
+            None,
+        )
+        custom_params = [
+            req.sampling_params.custom_params
+            if isinstance(req.sampling_params.custom_params, dict)
+            else {}
+            for req in reqs
+        ]
+        talker_can_decode = [
+            bool(req.talker_codec_ids)
+            and req.prev_residual_codes is not None
+            and req.prev_codec_input_embed is not None
+            and req.talker_kv_cache_locs is not None
+            for req in reqs
+        ]
+        tts_pad_embeds = [req.tts_pad_embed for req in reqs if req.tts_pad_embed is not None]
+        talker_position_deltas = [
+            req.talker_mrope_position_delta
+            if req.talker_mrope_position_delta is not None
+            else 0
+            for req in reqs
+        ]
+        speakers = []
+        for req in reqs:
+            if not getattr(req, "speaker", None):
+                raise RuntimeError(
+                    f"Qwen3-Omni ForwardBatch requires speaker state for request {req.rid}"
+                )
+            speakers.append(req.speaker)
+
+        self.model_specific_states = {
+            "thinker_done": torch.tensor(
+                [req.thinker_done for req in reqs], dtype=torch.bool, device=device
+            ),
+            "talker_post_thinker_started": torch.tensor(
+                [req.qwen3_omni_talker_post_thinker_started for req in reqs],
+                dtype=torch.bool,
+                device=device,
+            ),
+            "talker_has_text_lag": torch.tensor(
+                [bool(req.qwen3_omni_text_lag_tokens) for req in reqs],
+                dtype=torch.bool,
+                device=device,
+            ),
+            "talker_needs_tts_eos": torch.tensor(
+                [req.qwen3_omni_tts_eos_pending for req in reqs],
+                dtype=torch.bool,
+                device=device,
+            ),
+            "talker_step": torch.tensor(
+                [req.talker_step for req in reqs], dtype=torch.long, device=device
+            ),
+            "prev_codec_id": torch.tensor(
+                [req.talker_codec_ids[-1] if req.talker_codec_ids else 0 for req in reqs],
+                dtype=torch.long,
+                device=device,
+            ),
+            "talker_positions": (
+                torch.tensor(
+                    [
+                        req.talker_prefill_len + req.talker_step + delta
+                        for req, delta in zip(reqs, talker_position_deltas, strict=True)
+                    ],
+                    dtype=torch.long,
+                    device=device,
+                )
+                .unsqueeze(0)
+                .repeat(3, 1)
+            ),
+            "talker_needs_prefill": torch.tensor(
+                [req.talker_needs_prefill for req in reqs],
+                dtype=torch.bool,
+                device=device,
+            ),
+            "talker_can_decode": torch.tensor(
+                talker_can_decode,
+                dtype=torch.bool,
+                device=device,
+            ),
+            "prev_sampled_thinker_token": torch.tensor(
+                [
+                    req.qwen3_omni_text_lag_tokens[0]
+                    if req.qwen3_omni_text_lag_tokens
+                    else req.prev_sampled_thinker_token
+                    if req.prev_sampled_thinker_token is not None
+                    else 0
+                    for req in reqs
+                ],
+                dtype=torch.long,
+                device=device,
+            ),
+            "talker_temperature": torch.tensor(
+                [params.get("talker_temperature", 0.9) for params in custom_params],
+                dtype=torch.float,
+                device=device,
+            ),
+            "talker_top_k": torch.tensor(
+                [params.get("talker_top_k", 50) for params in custom_params],
+                dtype=torch.int32,
+                device=device,
+            ),
+            "talker_top_p": torch.tensor(
+                [params.get("talker_top_p", 1.0) for params in custom_params],
+                dtype=torch.float,
+                device=device,
+            ),
+            "talker_repetition_penalty": torch.tensor(
+                [params.get("talker_repetition_penalty", 1.05) for params in custom_params],
+                dtype=torch.float,
+                device=device,
+            ),
+            "talker_prev_codec_tokens": [
+                list(req.talker_codec_ids) if req.talker_codec_ids else [] for req in reqs
+            ],
+            "talker_repetition_mask": [req.talker_repetition_mask for req in reqs],
+            "talker_sampler_seed": torch.tensor(
+                [req.talker_sampler_seed for req in reqs],
+                dtype=torch.int64,
+                device=device,
+            ),
+            "talker_sampler_step": torch.tensor(
+                [len(req.talker_codec_ids) for req in reqs],
+                dtype=torch.int64,
+                device=device,
+            ),
+            "speakers": speakers,
+            "prompt_accept_hidden_states": [
+                req.qwen3_omni_prompt_accept_hidden for req in reqs
+            ],
+            "multimodal_inputs": batch.multimodal_inputs,
+        }
+
+        if codec_eos_token_id is not None:
+            self.model_specific_states["codec_eos_token_id"] = codec_eos_token_id
+        if len(tts_pad_embeds) == len(reqs):
+            self.model_specific_states["tts_pad_embed"] = torch.stack(tts_pad_embeds, dim=0)
+        if any(talker_can_decode):
+            residual_template = next(
+                req.prev_residual_codes
+                for req in reqs
+                if req.prev_residual_codes is not None
+            )
+            self.model_specific_states["prev_residual_codes"] = torch.tensor(
+                [
+                    req.prev_residual_codes
+                    if req.prev_residual_codes is not None
+                    else [0] * len(residual_template)
+                    for req in reqs
+                ],
+                dtype=torch.long,
+                device=device,
+            )
+            embed_template = next(
+                req.prev_codec_input_embed
+                for req in reqs
+                if req.prev_codec_input_embed is not None
+            )
+            self.model_specific_states["prev_codec_input_embeds"] = torch.stack(
+                [
+                    req.prev_codec_input_embed
+                    if req.prev_codec_input_embed is not None
+                    else torch.zeros_like(embed_template)
+                    for req in reqs
+                ],
+                dim=0,
+            ).to(device=device)
+
+        talker_kv_cache_locs_list = [req.talker_kv_cache_locs for req in reqs]
+        if any(locs is not None for locs in talker_kv_cache_locs_list):
+            self.model_specific_states["talker_kv_cache_locs_list"] = (
+                talker_kv_cache_locs_list
+            )
+            self.model_specific_states["talker_prefill_input_ids_list"] = [
+                req.talker_prefill_input_ids for req in reqs
+            ]
+        if any(req.talker_needs_prefill for req in reqs):
+            self.model_specific_states["origin_input_ids"] = [
+                torch.tensor(req.origin_input_ids, device=device, dtype=torch.long)
+                for req in reqs
+            ]
+            self.model_specific_states["origin_input_ids_cpu"] = [
+                list(req.origin_input_ids) for req in reqs
+            ]
+
     def compute_spec_mrope_positions(
         self, model_runner: ModelRunner, batch: ScheduleBatch
     ):
@@ -830,8 +1052,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # 3 * N
                 if (
                     mm_input is None
+                    or mm_input.mrope_position_delta is None
                     or get_global_server_args().rl_on_policy_target is not None
                 ):
+                    # text only, or streaming audio without vision-style mRoPE metadata
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
                         self.seq_lens_cpu[batch_idx] - 1,
@@ -849,9 +1073,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 if (
                     mm_input is None
+                    or mm_input.mrope_positions is None
                     or get_global_server_args().rl_on_policy_target is not None
                 ):
-                    # text only
+                    # text only, or streaming audio without vision-style mRoPE metadata
                     mrope_positions = torch.tensor(
                         [
                             [

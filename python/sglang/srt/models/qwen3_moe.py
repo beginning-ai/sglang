@@ -724,6 +724,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_layer_sparse: bool = True,
     ) -> None:
         super().__init__()
         self.config = config
@@ -762,16 +763,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
-        # Qwen3MoE all layers are sparse and have no nextn now
-        self.is_layer_sparse = True
-        is_previous_layer_sparse = True
-        is_next_layer_sparse = True
+        self.is_layer_sparse = is_layer_sparse
+        is_next_layer_sparse = is_layer_sparse
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
+            is_previous_layer_sparse=is_layer_sparse,
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
@@ -845,9 +844,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
             forward_batch
         )
 
-        hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-        )
+        if self.is_layer_sparse:
+            hidden_states = self.mlp(
+                hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+            )
+        else:
+            hidden_states = self.mlp(
+                hidden_states, should_allreduce_fusion, use_reduce_scatter
+            )
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -923,6 +927,7 @@ class Qwen3MoeModel(Qwen2MoeModel):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         decoder_layer_type=Qwen3MoeDecoderLayer,
+        layer_id_offset: int = 0,
     ) -> None:
         alt_stream = torch.cuda.Stream() if _is_cuda else None
         super().__init__(
@@ -931,6 +936,7 @@ class Qwen3MoeModel(Qwen2MoeModel):
             prefix=prefix,
             decoder_layer_type=decoder_layer_type,
             alt_stream=alt_stream,
+            layer_id_offset=layer_id_offset,
         )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: List[int]):
