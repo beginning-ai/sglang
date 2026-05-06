@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 )
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
+    HybridMultiHeadKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
@@ -612,6 +613,26 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     **extra_args,
                 )
+            elif sub_model_kv_configs := self.model_config.get_sub_model_kv_configs(
+                get_attention_tp_size()
+            ):
+                assert self.sub_model_max_total_num_tokens is not None
+                sub_model_kv_configs = [
+                    {
+                        **config,
+                        "size": self.sub_model_max_total_num_tokens[config["name"]],
+                    }
+                    for config in sub_model_kv_configs
+                ]
+                self.token_to_kv_pool = HybridMultiHeadKVPool(
+                    size=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_dim=self.model_config.head_dim,
+                    sub_model_configs=sub_model_kv_configs,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                )
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
@@ -785,6 +806,20 @@ class ModelRunnerKVCacheMixin:
                 "and --kv-cache-dtype != fp4_e2m1."
             )
 
+        component_allocators = {"thinker": self.token_to_kv_pool_allocator}
+        for name, size in self.token_to_kv_pool.sizes_by_name.items():
+            if name == "thinker":
+                continue
+            component_allocators[name] = TokenToKVPoolAllocator(
+                size,
+                dtype=self.kv_cache_dtype,
+                device=self.device,
+                kvcache=self.token_to_kv_pool,
+                need_sort=need_sort,
+            )
+        self.token_to_kv_pool_allocator.component_allocators = component_allocators
+        self.qwen3_omni_token_to_kv_pool_allocators = component_allocators
+
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
 
@@ -839,6 +874,7 @@ class ModelRunnerKVCacheMixin:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
         self.max_total_num_tokens = config.max_total_num_tokens
         self.max_running_requests = config.max_running_requests
+        self.sub_model_max_total_num_tokens = config.sub_model_max_total_num_tokens
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = config.full_max_total_num_tokens
             self.swa_max_total_num_tokens = config.swa_max_total_num_tokens

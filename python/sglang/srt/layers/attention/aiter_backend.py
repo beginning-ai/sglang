@@ -7,12 +7,15 @@ end to end attention solution with aiter kernels
 import logging
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.multistep_metadata import (
+    prepare_decode_multistep_metadata,
+)
 from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
     scatter_ragged_to_page_table_kernel,
     scatter_req_to_token_to_page_table_kernel,
@@ -1370,6 +1373,117 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.seq_lens_cpu.max().item(),
                     swa_page_table=swa_page_table,
                 )
+
+    def init_forward_metadata_multistep(
+        self,
+        forward_batch: ForwardBatch,
+        num_steps: int,
+        base_seq_len: int,
+    ) -> bool:
+        if self.use_mla:
+            return False
+        if self.use_triton_unified_attention:
+            return False
+        if self.use_sliding_window_kv_pool:
+            return False
+
+        max_bs = self.kv_indptr.shape[0] - 1
+
+        if not hasattr(self, "_capture_buffers"):
+            self._capture_buffers = {}
+        step_metadata = prepare_decode_multistep_metadata(
+            self._capture_buffers,
+            ("aiter", "decode_multistep"),
+            forward_batch,
+            num_steps,
+            base_seq_len,
+            buffer_batch_size=max_bs,
+            kv_indices_dtype=torch.int32,
+            include_seq_lens=False,
+        )
+        if step_metadata is None:
+            return False
+
+        metas: List[ForwardMetadata] = []
+        for step in step_metadata:
+            metas.append(
+                ForwardMetadata(
+                    kv_indptr=step.kv_indptr,
+                    kv_indices=step.kv_indices,
+                    qo_indptr=None,
+                    kv_last_page_len=None,
+                    max_q_len=1,
+                    max_kv_len=step.seq_len,
+                    run_graph=False,
+                )
+            )
+
+        self._multistep_metas = metas
+        self.forward_metadata = metas[0]
+        return True
+
+    def select_step(self, step: int) -> None:
+        self.forward_metadata = self._multistep_metas[step]
+
+    def init_forward_metadata_audio_prefill(
+        self,
+        forward_batch: ForwardBatch,
+        prefill_len: int,
+    ) -> bool:
+        if forward_batch.spec_info is not None:
+            return False
+        if self.use_mla:
+            return False
+        if self.use_triton_unified_attention:
+            return False
+        if self.use_sliding_window_kv_pool:
+            return False
+        override = forward_batch.override_req_to_token
+        if override is None:
+            return False
+        if override.shape[1] < prefill_len:
+            return False
+
+        bs = forward_batch.batch_size
+        total = bs * prefill_len
+        max_bs = self.kv_indptr.shape[0] - 1
+
+        if not hasattr(self, "_capture_buffers"):
+            self._capture_buffers = {}
+        cache_key = ("audio_prefill", prefill_len)
+        if cache_key not in self._capture_buffers:
+            indptr_template = torch.arange(
+                0,
+                (max_bs + 1) * prefill_len,
+                prefill_len,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            kv_indices_buf = torch.zeros(
+                max_bs * prefill_len + 256,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._capture_buffers[cache_key] = (indptr_template, kv_indices_buf)
+        indptr_template, kv_indices_buf = self._capture_buffers[cache_key]
+
+        kv_indptr = indptr_template[: bs + 1]
+        kv_indices_buf[:total] = (
+            override[:bs, :prefill_len].to(torch.int32).reshape(-1)
+        )
+        kv_indices_buf[total : total + 256] = override[0, 0].to(torch.int32)
+        self.qo_indptr[: bs + 1] = kv_indptr
+
+        self.forward_metadata = ForwardMetadata(
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices_buf,
+            qo_indptr=None,
+            kv_last_page_len=None,
+            max_q_len=prefill_len,
+            max_kv_len=prefill_len,
+            run_graph=False,
+        )
+        return True
 
     def init_cuda_graph_state(
         self,

@@ -44,6 +44,16 @@ def _get_llm_pos_ids_for_vision(
     return llm_pos_ids
 
 
+def _next_audio_start(input_tokens, st, audio_start_token_id, audio_token_id):
+    for idx in range(st, len(input_tokens) - 1):
+        if (
+            input_tokens[idx] == audio_start_token_id
+            and input_tokens[idx + 1] == audio_token_id
+        ):
+            return idx
+    return len(input_tokens) + 1
+
+
 def get_rope_index(
     spatial_merge_size: int,
     image_token_id: int,
@@ -82,7 +92,9 @@ def get_rope_index(
 
     mrope_position_deltas = []
     if input_ids is not None and (
-        image_grid_thw is not None or video_grid_thw is not None
+        image_grid_thw is not None
+        or video_grid_thw is not None
+        or audio_seqlens is not None
     ):
         total_input_ids = input_ids
         position_ids = torch.ones(
@@ -228,11 +240,15 @@ def get_rope_index_qwen3_omni(
     position_id_per_seconds = kwargs["position_id_per_seconds"]
     use_audio_in_video = kwargs.get("use_audio_in_video", False)
     audio_seqlens = kwargs.get("audio_seqlens", None)
+    audio_token_lens = kwargs.get("audio_token_lens", None)
     second_per_grids = second_per_grid_ts
 
     mrope_position_deltas = []
     if input_ids is not None and (
-        image_grid_thw is not None or video_grid_thw is not None
+        image_grid_thw is not None
+        or video_grid_thw is not None
+        or audio_seqlens is not None
+        or audio_token_lens is not None
     ):
         total_input_ids = input_ids
         position_ids = torch.zeros(
@@ -256,8 +272,13 @@ def get_rope_index_qwen3_omni(
                     if use_audio_in_video
                     else (vision_tokens == video_token_id).sum()
                 )
-            audio_nums = torch.sum(current_input_ids == audio_start_token_id)
             input_tokens = current_input_ids.tolist()
+            audio_nums = sum(
+                1
+                for idx in range(len(input_tokens) - 1)
+                if input_tokens[idx] == audio_start_token_id
+                and input_tokens[idx + 1] == audio_token_id
+            )
             llm_pos_ids_list: list = []
             st = 0
             remain_images, remain_videos, remain_audios = (
@@ -286,7 +307,9 @@ def get_rope_index_qwen3_omni(
                     else len(input_tokens) + 1
                 )
                 ed_audio_start = (
-                    input_tokens.index(audio_start_token_id, st)
+                    _next_audio_start(
+                        input_tokens, st, audio_start_token_id, audio_token_id
+                    )
                     if (audio_token_id in input_tokens and remain_audios > 0)
                     else len(input_tokens) + 1
                 )
@@ -307,9 +330,14 @@ def get_rope_index_qwen3_omni(
                 st_idx += bos_len
                 # Audio Only
                 if min_ed == ed_audio_start:
-                    audio_len = _get_feat_extract_output_lengths(
-                        audio_seqlens[audio_idx]
-                    )
+                    if audio_token_lens is None:
+                        audio_len = _get_feat_extract_output_lengths(
+                            audio_seqlens[audio_idx]
+                        )
+                    else:
+                        audio_len = audio_token_lens[audio_idx]
+                    if min_ed + bos_len + int(audio_len) == len(input_tokens):
+                        eos_len = 0
                     llm_pos_ids = (
                         torch.arange(audio_len).view(1, -1).expand(3, -1) + st_idx
                     )
@@ -377,9 +405,12 @@ def get_rope_index_qwen3_omni(
                 elif (
                     min_ed == ed_vision_start and ed_vision_start + 1 == ed_audio_start
                 ):
-                    audio_len = _get_feat_extract_output_lengths(
-                        audio_seqlens[audio_idx]
-                    )
+                    if audio_token_lens is None:
+                        audio_len = _get_feat_extract_output_lengths(
+                            audio_seqlens[audio_idx]
+                        )
+                    else:
+                        audio_len = audio_token_lens[audio_idx]
                     audio_llm_pos_ids = (
                         torch.arange(audio_len).view(1, -1).expand(3, -1) + st_idx
                     )

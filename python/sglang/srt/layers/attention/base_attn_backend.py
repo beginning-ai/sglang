@@ -23,6 +23,19 @@ class AttentionBackend(ABC):
         """Init the metadata for a forward pass."""
         raise NotImplementedError()
 
+    def init_forward_metadata_multistep(
+        self,
+        forward_batch: ForwardBatch,
+        num_steps: int,
+        base_seq_len: int,
+    ) -> bool:
+        """Precompute metadata for uniform decode steps if supported."""
+        return False
+
+    def select_step(self, step: int) -> None:
+        """Select one precomputed metadata step after multistep init."""
+        raise NotImplementedError()
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()

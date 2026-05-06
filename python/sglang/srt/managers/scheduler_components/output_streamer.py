@@ -471,6 +471,7 @@ class _GenerationStreamAccumulator:
             prompt_tokens=self.prompt_tokens,
             reasoning_tokens=self.reasoning_tokens,
             completion_tokens=self.completion_tokens,
+            talker_tokens=[0] * len(self.rids),
             cached_tokens=self.cached_tokens,
             cached_tokens_details=self.cached_tokens_details,
             input_token_logprobs_val=self.input_token_logprobs_val,

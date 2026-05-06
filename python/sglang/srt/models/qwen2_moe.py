@@ -725,6 +725,7 @@ class Qwen2MoeModel(nn.Module):
         prefix: str = "",
         decoder_layer_type: type[nn.Module] = Qwen2MoeDecoderLayer,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        layer_id_offset: int = 0,
     ) -> None:
         super().__init__()
         self.config = config
@@ -750,7 +751,7 @@ class Qwen2MoeModel(nn.Module):
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
-                layer_id=idx,
+                layer_id=idx + layer_id_offset,
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,

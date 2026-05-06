@@ -24,7 +24,7 @@ from abc import ABC
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 
@@ -1088,6 +1088,7 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     prompt_tokens: List[int]
     reasoning_tokens: List[int]
     completion_tokens: List[int]
+    talker_tokens: List[int]
     cached_tokens: List[int]
 
     # Logprobs
@@ -1136,6 +1137,8 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
+    # PCM16 audio chunks produced by the audio phase pipeline.
+    audio_chunks: Optional[List[List[bytes]]] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
@@ -1783,6 +1786,59 @@ class CloseSessionReqInput(BaseReq):
 
 
 @dataclass
+class CloseAudioSessionReqInput(BaseReq):
+    session_id: str
+    reason: Optional[str] = None
+
+
+@dataclass
+class CloseAudioSessionReqOutput(BaseReq):
+    session_id: str
+    turn_count: int
+    active_request_count: int
+
+
+@dataclass
+class HeartbeatAudioSessionReqInput(BaseReq):
+    session_id: str
+    lease_token: str
+    ttl_secs: int
+
+
+@dataclass
+class HeartbeatAudioSessionReqOutput(BaseReq):
+    session_id: str
+    success: bool
+    message: str
+    lease_expires_at_unix: float
+
+
+@dataclass
+class AudioSessionRebuildTurn:
+    turn_index: int
+    turn_rid: str
+    assistant_text: str
+    audio_chunks: List[Tuple[torch.Tensor, int]]
+
+
+@dataclass
+class AudioSessionRebuildReqInput(BaseReq):
+    session_id: str
+    system_prompt: str
+    speaker: str
+    sampling_params: Any
+    turns: List[AudioSessionRebuildTurn]
+
+
+@dataclass
+class AudioSessionRebuildReqOutput(BaseReq):
+    session_id: str
+    latest_turn_rid: str
+    prefix_turn_count: int
+    prompt_tokens: int
+
+
+@dataclass
 class OpenSessionReqOutput(BaseReq):
     session_id: Optional[str]
     success: bool
@@ -2121,6 +2177,38 @@ class DumperControlReqOutput(BaseReq):
     success: bool
     response: List[Dict[str, Any]]
     error: str = ""
+
+
+@dataclass
+class AudioTurnStartReqInput(BaseReq):
+    """Start a Qwen3-Omni audio turn.
+
+    This is intentionally an internal, phase-friendly message rather than a
+    mirror of any public gRPC contract. The public API can evolve around the
+    async pipeline while the scheduler receives explicit turn lifecycle events.
+    """
+
+    session_id: str
+    sampling_params: Any
+    parent_rid: Optional[str] = None
+    system_prompt: Optional[str] = None
+    speaker: Optional[str] = None
+
+
+@dataclass
+class AudioInputChunkReqInput(BaseReq):
+    """Append one buffered mel-feature chunk to an audio turn."""
+
+    mel_features: torch.Tensor
+    num_frames: int = 100
+
+
+@dataclass
+class AudioInputEndReqInput(BaseReq):
+    """Mark audio input complete and optionally append the final partial chunk."""
+
+    final_mel_features: Optional[torch.Tensor] = None
+    final_num_frames: int = 0
 
 
 def _check_all_req_types():

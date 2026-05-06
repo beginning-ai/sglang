@@ -9,6 +9,9 @@ import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.multistep_metadata import (
+    prepare_decode_multistep_metadata,
+)
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
@@ -493,6 +496,98 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets,
             swa_attn_logits=swa_attn_logits,
         )
+
+    def init_forward_metadata_multistep(
+        self,
+        forward_batch: ForwardBatch,
+        num_steps: int,
+        base_seq_len: int,
+    ) -> bool:
+        if self.use_mla:
+            return False
+        if self.sliding_window_size is not None and self.sliding_window_size > 0:
+            return False
+        if self.swa_v_head_dim is not None:
+            return False
+
+        bs = forward_batch.batch_size
+
+        if not hasattr(self, "_capture_buffers"):
+            self._capture_buffers = {}
+        step_metadata = prepare_decode_multistep_metadata(
+            self._capture_buffers,
+            ("triton", "decode_multistep"),
+            forward_batch,
+            num_steps,
+            base_seq_len,
+            buffer_batch_size=bs,
+            kv_indices_dtype=torch.int64,
+            include_seq_lens=True,
+        )
+        if step_metadata is None:
+            return False
+
+        buffers_key = (
+            "triton",
+            "decode_multistep_scratch",
+            bs,
+            num_steps,
+            base_seq_len,
+        )
+        if buffers_key not in self._capture_buffers:
+            self._capture_buffers[buffers_key] = (
+                torch.empty(
+                    (
+                        num_steps,
+                        bs,
+                        self.num_head,
+                        self.max_kv_splits,
+                        self.v_head_dim,
+                    ),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                torch.empty(
+                    (num_steps, bs, self.num_head, self.max_kv_splits),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                torch.empty((num_steps, bs), dtype=torch.int32, device=self.device),
+            )
+        attn_logits_buf, attn_lse_buf, num_kv_splits_buf = self._capture_buffers[
+            buffers_key
+        ]
+
+        metas: List[ForwardMetadata] = []
+        for idx, step in enumerate(step_metadata):
+            assert step.seq_lens is not None
+            num_kv_splits = num_kv_splits_buf[idx, :bs]
+            self.get_num_kv_splits(num_kv_splits, step.seq_lens)
+            metas.append(
+                ForwardMetadata(
+                    attn_logits=attn_logits_buf[idx, :bs],
+                    attn_lse=attn_lse_buf[idx, :bs],
+                    max_extend_len=None,
+                    num_kv_splits=num_kv_splits,
+                    kv_indptr=step.kv_indptr,
+                    kv_indices=step.kv_indices,
+                    qo_indptr=None,
+                    custom_mask=None,
+                    mask_indptr=None,
+                    window_kv_indptr=None,
+                    window_kv_indices=None,
+                    window_num_kv_splits=None,
+                    window_kv_offsets=None,
+                    swa_attn_logits=None,
+                )
+            )
+
+        self._multistep_metas = metas
+        self.forward_metadata = metas[0]
+        return True
+
+    def select_step(self, step: int) -> None:
+        self.forward_metadata = self._multistep_metas[step]
 
     def init_cuda_graph_state(
         self,

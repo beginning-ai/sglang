@@ -497,6 +497,11 @@ class TpModelWorker(BaseTpWorker):
                     batch_result.next_token_ids = self.model_runner.sample(
                         logits_output, forward_batch
                     )
+                    if hasattr(
+                        self.model_runner.model,
+                        "run_qwen3_omni_audio_phase_after_sample",
+                    ):
+                        batch_result.qwen3_omni_audio_forward_batch = forward_batch
                     return batch_result
 
                 batch_result.delay_sample_func = sample_batch_func
@@ -507,6 +512,11 @@ class TpModelWorker(BaseTpWorker):
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
                 )
+                if hasattr(
+                    self.model_runner.model,
+                    "run_qwen3_omni_audio_phase_after_sample",
+                ):
+                    batch_result.qwen3_omni_audio_forward_batch = forward_batch
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
@@ -523,6 +533,19 @@ class TpModelWorker(BaseTpWorker):
                     self.model_runner.compute_logprobs_only(
                         logits_output, forward_batch
                     )
+                if (
+                    hasattr(
+                        self.model_runner.model,
+                        "run_qwen3_omni_audio_phase_after_sample",
+                    )
+                    and batch is not None
+                    and batch.reqs is not None
+                    and any(
+                        req.qwen3_omni_rebuild_request
+                        for req in batch.reqs
+                    )
+                ):
+                    batch_result.qwen3_omni_audio_forward_batch = forward_batch
 
             return batch_result
         else:

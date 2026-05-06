@@ -376,11 +376,36 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
     def compute_mrope_positions(self, input_ids, mm_items):
         image_grid_thw = None
         video_grid_thw = None
+        input_ids = list(input_ids)
+        audio_feature_lens = []
         for item in mm_items:
             if "image_grid_thw" in item.model_specific_data:
                 image_grid_thw = item.model_specific_data["image_grid_thw"]
             if "video_grid_thw" in item.model_specific_data:
                 video_grid_thw = item.model_specific_data["video_grid_thw"]
+            if item.is_audio():
+                for start, end in item.offsets:
+                    input_ids[start : end + 1] = [self.audio_token_id] * (
+                        end - start + 1
+                    )
+                audio_feature_len = getattr(item, "audio_feature_lens", None)
+                if audio_feature_len is None:
+                    audio_attention_mask = getattr(
+                        item, "feature_attention_mask", None
+                    )
+                    if audio_attention_mask is None:
+                        raise RuntimeError(
+                            "Qwen3-Omni streaming mRoPE requires audio feature "
+                            "lengths or feature_attention_mask"
+                        )
+                    audio_feature_len = audio_attention_mask.sum(dim=-1)
+                audio_feature_lens.append(audio_feature_len.flatten().sum())
+
+        audio_feature_lens = (
+            torch.stack(audio_feature_lens).sum().view(1)
+            if audio_feature_lens
+            else None
+        )
 
         input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
@@ -395,6 +420,15 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             input_ids=input_ids_tensor,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
+            use_audio_in_video=False,
+            audio_seqlens=(
+                audio_feature_lens if self.model_type == "qwen3_omni_moe" else None
+            ),
+            audio_token_id=getattr(self.hf_config, "audio_token_id", None),
+            audio_start_token_id=self.audio_start_token_id,
+            position_id_per_seconds=getattr(
+                self.hf_config, "position_id_per_seconds", None
+            ),
         )
         return mrope_positions.squeeze(1), mrope_position_delta
 

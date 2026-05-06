@@ -331,10 +331,18 @@ class StreamingSession(BasePrefixCache):
         if not _is_streaming(req):
             return False
         if chunked:
+            assert req.req_pool_idx is not None
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(req.fill_ids)
             ]
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            session_id = req.session.session_id
+            slot = self.slots.get(session_id)
+            is_first = slot is None
+            if is_first:
+                slot = SessionSlot()
+                self.slots[session_id] = slot
+            slot.save_from_req(req, is_first=is_first)
             return True
         if req.session.session_id in self.slots:
             return True
@@ -424,7 +432,7 @@ class StreamingSession(BasePrefixCache):
                 active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
             )
             if slot.is_holding_kv and not in_batch:
-                allocated = ceil_align(slot.kv_allocated_len, self.page_size)
+                allocated = ceil_align(slot.kv_allocated_len, self._kv_page_size())
                 total += allocated - slot.cache_protected_len
         return total
 
@@ -440,7 +448,7 @@ class StreamingSession(BasePrefixCache):
                 active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
             )
             if slot.is_holding_kv and not in_batch:
-                allocated = ceil_align(slot.kv_allocated_len, self.page_size)
+                allocated = ceil_align(slot.kv_allocated_len, self._kv_page_size())
                 total += allocated - max(
                     slot.cache_protected_len, slot.swa_evicted_seqlen
                 )
@@ -491,17 +499,21 @@ class StreamingSession(BasePrefixCache):
 
     # -- Internal helpers (streaming body bits) --
 
+    def _kv_page_size(self) -> int:
+        return getattr(self.token_to_kv_pool_allocator, "page_size", self.page_size)
+
     def _free_tail(self, slot: SessionSlot, req: Req, prefix_len: int) -> None:
         """match_prefix path: free orphaned KV in [prefix_len, kv_allocated_len)
         before alloc_for_extend overwrites it. The gap appears when spec
         decoding pushes allocated above committed, or when retract retry's
         logit-reserve pulls prefix_len below committed.
         """
-        self._free_kv_aligned(slot.req_pool_idx, prefix_len, slot.kv_allocated_len)
-        slot.kv_allocated_len = prefix_len
+        slot.kv_allocated_len = self._free_kv_aligned(
+            slot.req_pool_idx, prefix_len, slot.kv_allocated_len
+        )
         slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
         slot.swa_evicted_seqlen = min(slot.swa_evicted_seqlen, prefix_len)
-        req.kv_allocated_len = prefix_len
+        req.kv_allocated_len = slot.kv_allocated_len
         req.kv_committed_len = min(req.kv_committed_len, prefix_len)
         req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, prefix_len)
 
@@ -512,13 +524,14 @@ class StreamingSession(BasePrefixCache):
         be released to avoid token/KV mismatch.
         """
         target = len(req.origin_input_ids) + finished_len
-        self._free_kv_aligned(req.req_pool_idx, target, req.kv_allocated_len)
-        req.kv_allocated_len = min(req.kv_allocated_len, target)
+        req.kv_allocated_len = self._free_kv_aligned(
+            req.req_pool_idx, target, req.kv_allocated_len
+        )
         req.kv_committed_len = min(req.kv_committed_len, target)
         req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, target)
         req.output_ids = req.output_ids[:finished_len]
 
-    def _free_kv_aligned(self, pool_idx: int, target: int, end: int) -> None:
+    def _free_kv_aligned(self, pool_idx: int, target: int, end: int) -> int:
         """Free req_to_token[pool_idx, ceil_align(target):end). Page-aligned
         because PagedTokenToKVPoolAllocator.free returns whole pages
         (free_index // page_size), so partial-page free would corrupt pages
@@ -526,13 +539,21 @@ class StreamingSession(BasePrefixCache):
         stays attached until release_session frees the whole page.
         """
         if end <= target:
-            return
+            return end
+        if not self.token_to_kv_pool_allocator.is_not_in_free_group:
+            # The allocator has accepted a batched-free group but has not exposed
+            # those indices as available yet. Keep the streaming slot owning the
+            # tail so the scheduler memory invariant can still account for it.
+            return end
         start = target
-        if self.page_size > 1:
-            start = ceil_align(start, self.page_size)
+        page_size = self._kv_page_size()
+        if page_size > 1:
+            start = ceil_align(start, page_size)
         if start < end:
             tail = self.req_to_token_pool.req_to_token[pool_idx, start:end]
             self.token_to_kv_pool_allocator.free(tail)
+            return start
+        return end
 
     @staticmethod
     def _mark_kv_freed(req: Req) -> None:

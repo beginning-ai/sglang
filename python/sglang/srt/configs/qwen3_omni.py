@@ -276,7 +276,7 @@ class Qwen3OmniMoeTalkerCodePredictorConfig(PretrainedConfig):
         sliding_window=None,
         layer_types=None,
         attention_dropout=0,
-        num_code_groups=32,
+        num_code_groups=16,
         **kwargs,
     ):
         super().__init__(
@@ -369,6 +369,7 @@ class Qwen3OmniMoeTalkerTextConfig(PretrainedConfig):
         attention_dropout=0,
         decoder_sparse_step=1,
         moe_intermediate_size=384,
+        shared_expert_intermediate_size=768,
         num_experts_per_tok=8,
         num_experts=128,
         norm_topk_prob=False,
@@ -406,6 +407,7 @@ class Qwen3OmniMoeTalkerTextConfig(PretrainedConfig):
         # MoE arguments
         self.decoder_sparse_step = decoder_sparse_step
         self.moe_intermediate_size = moe_intermediate_size
+        self.shared_expert_intermediate_size = shared_expert_intermediate_size
         self.num_experts_per_tok = num_experts_per_tok
         self.num_experts = num_experts
         self.norm_topk_prob = norm_topk_prob
@@ -425,7 +427,7 @@ class Qwen3OmniMoeTalkerConfig(PretrainedConfig):
         self,
         code_predictor_config=None,
         text_config=None,
-        num_code_groups=32,
+        num_code_groups=16,
         thinker_hidden_size=2048,
         codec_eos_token_id=4198,
         accept_hidden_layer=18,
@@ -562,7 +564,6 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
         assistant_token_id=77091,
         **kwargs,
     ):
-        super().__init__(**kwargs)
         if thinker_config is None:
             thinker_config = {}
             logger.info(
@@ -584,6 +585,7 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
         self.thinker_config = Qwen3OmniMoeThinkerConfig(**thinker_config)
         self.talker_config = Qwen3OmniMoeTalkerConfig(**talker_config)
         self.code2wav_config = Qwen3OmniMoeCode2WavConfig(**code2wav_config)
+        super().__init__(**kwargs)
         self.enable_audio_output = enable_audio_output
         self.im_start_token_id = im_start_token_id
         self.im_end_token_id = im_end_token_id

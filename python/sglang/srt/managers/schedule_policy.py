@@ -101,6 +101,21 @@ def match_prefix_for_req(
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
         match_result = zero_match_result(tree_cache, match_result)
+    # If the cache returned no match but the request already has accumulated
+    # prefix_indices from an in-progress chunked prefill (e.g., Qwen3-Omni
+    # audio chunked prefill bouncing the request through the waiting queue),
+    # preserve the existing prefix_indices. Otherwise the KV slots they
+    # reference become orphaned (no req-to-token mapping, no free at
+    # request finish), leaking ~prompt-prefix-length slots per request.
+    # ChunkCache (used when --disable-radix-cache) never indexes anything,
+    # so it always returns empty here; without this preservation, the
+    # chunked-prefill carry-over is destroyed on every iteration boundary.
+    if (
+        len(match_result.device_indices) == 0
+        and len(req.prefix_indices) > 0
+    ):
+        return match_result
+
     (
         req.prefix_indices,
         req.last_node,

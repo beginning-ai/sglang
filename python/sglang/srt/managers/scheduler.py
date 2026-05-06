@@ -22,6 +22,7 @@ import sys
 import time
 from collections import deque
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -37,6 +38,7 @@ from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
+from sglang.srt.audio import get_audio_token_count
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
@@ -85,6 +87,11 @@ from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
+    AudioSessionRebuildReqInput,
+    AudioSessionRebuildReqOutput,
+    AudioInputChunkReqInput,
+    AudioInputEndReqInput,
+    AudioTurnStartReqInput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -92,6 +99,8 @@ from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
+    CloseAudioSessionReqInput,
+    CloseAudioSessionReqOutput,
     CloseSessionReqInput,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -108,6 +117,8 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetLoadsReqInput,
     GetWeightsByNameReqInput,
+    HeartbeatAudioSessionReqInput,
+    HeartbeatAudioSessionReqOutput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -148,7 +159,12 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
 )
 from sglang.srt.managers.schedule_batch import (
+    AUDIO_BATCH_DELAY_MS,
+    AUDIO_STREAM_PREFILL_BATCH_DELAY_MS,
     FINISH_ABORT,
+    MM_PAD_SHIFT_VALUE,
+    Modality,
+    MultimodalDataItem,
     MultimodalInputs,
     Req,
     ScheduleBatch,
@@ -208,11 +224,16 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
+from sglang.srt.managers.scheduler_output_processor_mixin import (
+    SchedulerOutputProcessorMixin,
+)
+from sglang.srt.managers.scheduler_qwen3_omni_mixin import SchedulerQwen3OmniMixin
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
+    Qwen3OmniAudioPhaseItem,
     is_health_check_generate_req,
     validate_input_length,
 )
@@ -273,6 +294,9 @@ else:
 
 logger = logging.getLogger(__name__)
 
+_QWEN3_OMNI_AUDIO_END_TOKEN_ID = 151670
+_QWEN3_OMNI_NEWLINE_TOKEN_ID = 198
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
@@ -280,8 +304,29 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
 
+QWEN3_OMNI_TALKER_PREFIX_COMPONENT = "qwen3_omni_talker_user_prefix"
+
+
+@dataclass
+class Qwen3OmniTalkerPrefixState:
+    kv_cache_locs: torch.Tensor
+    prefill_input_ids: torch.Tensor
+
+
+@dataclass
+class AudioSessionState:
+    """Backend-owned multi-turn audio session state."""
+
+    speaker: Optional[str] = None
+    completed_turn_count: int = 0
+    lease_token: Optional[str] = None
+    last_backend_heartbeat_at: Optional[float] = None
+    lease_expires_at: Optional[float] = None
+
 
 class Scheduler(
+    SchedulerQwen3OmniMixin,
+    SchedulerOutputProcessorMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerMultiplexMixin,
@@ -328,6 +373,7 @@ class Scheduler(
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
+        self._qwen3_omni_overlap_last_batch_result_processed = False
         self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
@@ -373,6 +419,7 @@ class Scheduler(
 
         # Init model configs
         self.init_model_config()
+        self._validate_qwen3_omni_streaming_session_required()
 
         # Init metrics stats
         self.metrics_collector_context = SchedulerMetricsCollector.init_new(
@@ -675,6 +722,7 @@ class Scheduler(
         )
 
         self.batch_result_processor = SchedulerBatchResultProcessor(
+            scheduler=self,
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
             enable_overlap=self.enable_overlap,
@@ -698,6 +746,59 @@ class Scheduler(
         )
 
         self.is_initializing = False
+
+    def _is_qwen3_omni_batch(self, batch: ScheduleBatch) -> bool:
+        return any(
+            getattr(req, "codec_eos_token_id", None) is not None
+            or getattr(req, "qwen3_omni_rebuild_request", False)
+            or getattr(req, "audio_session_id", None) is not None
+            for req in batch.reqs
+        )
+
+    def get_loads(self, req: GetLoadsReqInput):
+        return self.load_inquirer.get_loads(req)
+
+    def _streaming_session_count(self) -> int:
+        return self.pool_stats_observer.streaming_session_count()
+
+    def _session_held_tokens(self) -> int:
+        return self.pool_stats_observer.session_held_tokens()
+
+    def _session_held_req_count(self) -> int:
+        return self.pool_stats_observer.session_held_req_count()
+
+    @property
+    def enable_metrics(self) -> bool:
+        return self.server_args.enable_metrics
+
+    @property
+    def is_stats_logging_rank(self) -> bool:
+        return self.metrics_collector_context.is_stats_logging_rank
+
+    @property
+    def num_generated_tokens(self) -> int:
+        return self.metrics_reporter.num_generated_tokens
+
+    @num_generated_tokens.setter
+    def num_generated_tokens(self, value: int) -> None:
+        self.metrics_reporter.num_generated_tokens = value
+
+    @property
+    def forward_ct_decode(self) -> int:
+        return self.metrics_reporter.forward_ct_decode
+
+    @forward_ct_decode.setter
+    def forward_ct_decode(self, value: int) -> None:
+        self.metrics_reporter.forward_ct_decode = value
+
+    def update_spec_metrics(self, bs: int, num_correct_drafts: int) -> None:
+        self.metrics_reporter.update_spec_metrics(bs, num_correct_drafts)
+
+    def report_prefill_stats(self, **kwargs) -> None:
+        self.metrics_reporter.report_prefill_stats(**kwargs)
+
+    def report_decode_stats(self, *args, **kwargs) -> None:
+        self.metrics_reporter.report_decode_stats(*args, **kwargs)
 
     def init_zbal_on_npu(self):
         if _is_npu:
@@ -983,6 +1084,17 @@ class Scheduler(
                 startup_available_gpu_memory_gb=avail_mem,
             )
 
+    def _validate_qwen3_omni_streaming_session_required(self):
+        if (
+            getattr(self.model_config.hf_config, "model_type", None)
+            == "qwen3_omni_moe"
+            and not self.server_args.enable_streaming_session
+        ):
+            raise RuntimeError(
+                "Qwen3-Omni audio requires --enable-streaming-session. "
+                "The non-streaming audio KV ownership path has been removed."
+            )
+
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
@@ -1001,6 +1113,9 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        self.audio_turn_reqs: Dict[str, Req] = {}
+        self.audio_sessions: Dict[str, AudioSessionState] = {}
+        self._init_qwen3_omni_state()
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1368,6 +1483,9 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                (CloseAudioSessionReqInput, self.close_audio_session),
+                (HeartbeatAudioSessionReqInput, self.heartbeat_audio_session),
+                (AudioSessionRebuildReqInput, self.handle_audio_session_rebuild),
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
@@ -1448,6 +1566,9 @@ class Scheduler(
                     ListExternalCorporaReqInput,
                     self.list_external_corpora,
                 ),
+                (AudioTurnStartReqInput, self.handle_audio_turn_start),
+                (AudioInputChunkReqInput, self.handle_audio_input_chunk),
+                (AudioInputEndReqInput, self.handle_audio_input_end),
             ]
         )
 
@@ -1509,6 +1630,10 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            if self._run_qwen3_omni_audio_lane_if_selected():
+                self.cur_batch = None
+                continue
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1538,11 +1663,36 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        def pending_qwen3_omni_result_needs_commit_before_schedule():
+            return (
+                self.result_queue
+                and self.last_batch
+                and any(
+                    req.codec_eos_token_id is not None
+                    or req.talker_needs_prefill
+                    or bool(req.talker_codec_ids)
+                    or req.qwen3_omni_prompt_accept_hidden is not None
+                    for req in self.last_batch.reqs
+                )
+            )
+
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                continue
+
+            processed_last_batch_before_schedule = (
+                self._qwen3_omni_overlap_last_batch_result_processed
+            )
+            if pending_qwen3_omni_result_needs_commit_before_schedule():
+                pop_and_process()
+                processed_last_batch_before_schedule = True
+                self._qwen3_omni_overlap_last_batch_result_processed = True
+
+            if self._run_qwen3_omni_audio_lane_if_selected():
+                self.cur_batch = None
                 continue
 
             # Get the next batch to run
@@ -1552,7 +1702,7 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch and not processed_last_batch_before_schedule:
                 pop_and_process()
 
             # Launch the current batch
@@ -1564,7 +1714,10 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if (
+                    not disable_overlap_for_batch
+                    and not processed_last_batch_before_schedule
+                ):
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -1577,6 +1730,7 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+            self._qwen3_omni_overlap_last_batch_result_processed = False
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
@@ -2311,9 +2465,20 @@ class Scheduler(
 
             # Filter batch
             last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
+            existing_rids = {req.rid for req in self.running_batch.reqs}
+            keep_indices = [
+                i
+                for i, req in enumerate(self.last_batch.reqs)
+                if req not in chunked_req_to_exclude
+                and getattr(
+                    req,
+                    "_prefill_audio_done_snapshot",
+                    getattr(req, "audio_input_done", True),
+                )
+                and not req.finished()
+                and req.rid not in existing_rids
+            ]
+            self.last_batch.filter_batch(keep_indices=keep_indices)
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
@@ -2498,7 +2663,21 @@ class Scheduler(
                 )
 
         # Get requests from the waiting queue to a new prefill batch
+        now = time.perf_counter()
         for req in self.waiting_queue:
+            if req.audio_input_prefill_inflight:
+                continue
+            # Non-final streaming audio chunks can wait longer than audio-lane
+            # decode work: the user is still speaking, while EOI/final chunks
+            # bypass this path to preserve speech-to-speech latency.
+            if (
+                req.audio_session_id
+                and len(self.audio_turn_reqs) > 1
+                and not req.audio_input_done
+                and req.qwen3_omni_stream_prefill_ready_at > now
+            ):
+                continue
+
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -2586,6 +2765,11 @@ class Scheduler(
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+
+        for req in can_run_list:
+            req._prefill_audio_done_snapshot = req.audio_input_done
+            if req.audio_session_id and not req._prefill_audio_done_snapshot:
+                req.audio_input_prefill_inflight = True
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -3108,6 +3292,8 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
+        idle &= len(self.qwen3_omni_audio_phase_queue) == 0
+        idle &= len(self.audio_turn_reqs) == 0
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch
@@ -3291,6 +3477,12 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
 
+        if (
+            getattr(self.model_config.hf_config, "model_type", None)
+            == "qwen3_omni_moe"
+        ):
+            ret["qwen3_omni_audio"] = self._qwen3_omni_runtime_snapshot()
+
         # This field is not serializable.
         ret.pop("model_config", None)
 
@@ -3372,6 +3564,8 @@ class Scheduler(
 
     def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator
+        self._purge_qwen3_omni_audio_phase_queue(recv_req)
+
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
@@ -3387,7 +3581,11 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            self.audio_turn_reqs.pop(req.rid, None)
+            self._send_abort_output(
+                req,
+                AbortReq(finished_reason=recv_req.finished_reason, rid=req.rid),
+            )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
@@ -3605,6 +3803,671 @@ class Scheduler(
 
     def close_session(self, recv_req: CloseSessionReqInput):
         self.session_controller.close(recv_req)
+
+    def close_audio_session(self, recv_req: CloseAudioSessionReqInput):
+        turn_count, active_request_count = self._close_audio_session_state(
+            recv_req.session_id
+        )
+        self.ipc_channels.send_to_detokenizer.send_output(
+            CloseAudioSessionReqOutput(
+                rid=recv_req.rid,
+                session_id=recv_req.session_id,
+                turn_count=turn_count,
+                active_request_count=active_request_count,
+            ),
+            recv_req,
+        )
+
+    def heartbeat_audio_session(self, recv_req: HeartbeatAudioSessionReqInput):
+        session = self.audio_sessions.get(recv_req.session_id)
+        if session is None:
+            self.ipc_channels.send_to_detokenizer.send_output(
+                HeartbeatAudioSessionReqOutput(
+                    rid=recv_req.rid,
+                    session_id=recv_req.session_id,
+                    success=False,
+                    message=f"audio session {recv_req.session_id} not found",
+                    lease_expires_at_unix=0.0,
+                ),
+                recv_req,
+            )
+            return
+
+        now = time.time()
+        session.lease_token = recv_req.lease_token
+        session.last_backend_heartbeat_at = now
+        session.lease_expires_at = now + recv_req.ttl_secs
+        self.ipc_channels.send_to_detokenizer.send_output(
+            HeartbeatAudioSessionReqOutput(
+                rid=recv_req.rid,
+                session_id=recv_req.session_id,
+                success=True,
+                message="audio session lease extended",
+                lease_expires_at_unix=session.lease_expires_at,
+            ),
+            recv_req,
+        )
+
+    def _send_abort_output(self, req: Req, abort_req: AbortReq):
+        if req.audio_session_id is not None:
+            self.ipc_channels.send_to_detokenizer.send_output(abort_req, req)
+        else:
+            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+
+    def _abort_audio_turn_start(
+        self, recv_req: AudioTurnStartReqInput, message: str
+    ) -> None:
+        self.ipc_channels.send_to_detokenizer.send_output(
+            AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.BAD_REQUEST,
+                    "message": message,
+                },
+                rid=recv_req.rid,
+            ),
+            recv_req,
+        )
+
+    def _get_or_open_audio_streaming_session(self, session_id: str):
+        if not self.server_args.enable_streaming_session:
+            raise RuntimeError(
+                "Qwen3-Omni audio requires --enable-streaming-session"
+            )
+        if not self.tree_cache.supports_streaming_session():
+            raise RuntimeError(
+                "Qwen3-Omni audio streaming sessions require a "
+                "streaming-session-aware prefix cache"
+            )
+
+        session = self.session_controller.get(session_id)
+        if session is None:
+            output = self.session_controller.open(
+                OpenSessionReqInput(
+                    capacity_of_str_len=0,
+                    session_id=session_id,
+                    streaming=True,
+                )
+            )
+            if not output.success:
+                raise RuntimeError(
+                    f"failed to open Qwen3-Omni streaming session {session_id}"
+                )
+            session = self.session_controller.get(session_id)
+        if session is None or not session.streaming:
+            raise RuntimeError(
+                f"Qwen3-Omni audio session {session_id} is not backed by an "
+                "upstream streaming session"
+            )
+        return session
+
+    def _close_audio_session_state(self, session_id: str) -> Tuple[int, int]:
+        session = self.audio_sessions.pop(session_id, None)
+        turn_count = 0
+        if session is not None:
+            turn_count = session.completed_turn_count
+
+        streaming_session = self.session_controller.get(session_id)
+        if streaming_session is not None:
+            self._release_audio_session_talker_prefix(streaming_session)
+
+        if session_id in self.session_controller:
+            self.session_controller.close(CloseSessionReqInput(session_id=session_id))
+
+        active_rids = [
+            req.rid
+            for req in self.audio_turn_reqs.values()
+            if req.audio_session_id == session_id
+        ]
+        for rid in active_rids:
+            self.abort_request(AbortReq(rid=rid))
+
+        if (
+            not self.audio_sessions
+            and not self.audio_turn_reqs
+            and self.is_fully_idle()
+        ):
+            self.flush_cache(empty_cache=False)
+
+        if not self.audio_turn_reqs:
+            self._log_qwen3_omni_runtime_snapshot("audio_session_closed_idle")
+
+        return turn_count, len(active_rids)
+
+    def _release_audio_session_talker_prefix(self, streaming_session):
+        talker_prefix = streaming_session.pop_component_kv(
+            QWEN3_OMNI_TALKER_PREFIX_COMPONENT
+        )
+        if talker_prefix is None:
+            return
+        talker_allocator = (
+            self.tp_worker.model_runner.qwen3_omni_token_to_kv_pool_allocators[
+                "talker"
+            ]
+        )
+        talker_allocator.free(talker_prefix.kv_cache_locs)
+
+    def _store_audio_turn_state(self, req: Req):
+        if isinstance(req.finished_reason, FINISH_ABORT):
+            self.audio_turn_reqs.pop(req.rid, None)
+            return
+
+        session = self.audio_sessions.get(req.audio_session_id)
+        if session is None:
+            logger.warning(
+                "Audio session %s not found for completed turn %s",
+                req.audio_session_id,
+                req.rid,
+            )
+            self.audio_turn_reqs.pop(req.rid, None)
+            return
+
+        if req.session is None or not req.session.streaming:
+            raise RuntimeError(
+                f"Qwen3-Omni audio turn {req.rid} completed without a streaming "
+                "session; non-streaming Thinker KV retention was removed"
+            )
+
+        if req.qwen3_omni_prompt_accept_hidden is not None:
+            req.qwen3_omni_prompt_accept_hidden = (
+                req.qwen3_omni_prompt_accept_hidden.detach()
+            )
+
+        self._store_talker_prefix_component_kv(req, "audio turn")
+        session.completed_turn_count += 1
+        self.audio_turn_reqs.pop(req.rid, None)
+        if not self.audio_turn_reqs:
+            self._log_qwen3_omni_runtime_snapshot("audio_turns_idle")
+
+    def _store_talker_prefix_component_kv(
+        self, req: Req, owner: str, require_prefix: bool = False
+    ):
+        talker_user_kv_cache_locs = req.talker_kv_cache_locs
+        talker_user_prefill_input_ids = req.talker_prefill_input_ids
+        if (talker_user_kv_cache_locs is None) != (
+            talker_user_prefill_input_ids is None
+        ):
+            raise RuntimeError(
+                f"Qwen3-Omni {owner} {req.rid} has incomplete Talker "
+                "user-prefix cache state"
+            )
+        assert (
+            req.session.get_component_kv(QWEN3_OMNI_TALKER_PREFIX_COMPONENT) is None
+        ), (
+                f"Qwen3-Omni audio session {req.audio_session_id} still owns "
+                f"Talker user-prefix KV while storing {owner}"
+        )
+        if talker_user_kv_cache_locs is None:
+            if require_prefix:
+                raise RuntimeError(
+                    f"Qwen3-Omni {owner} {req.rid} completed without "
+                    "Talker user-prefix KV"
+                )
+        else:
+            if len(talker_user_kv_cache_locs) != req.talker_user_prefill_len:
+                raise RuntimeError(
+                    f"Qwen3-Omni {owner} {req.rid} is storing non-prefix "
+                    f"Talker KV: kv_len={len(talker_user_kv_cache_locs)}, "
+                    f"user_prefix_len={req.talker_user_prefill_len}"
+                )
+            if len(talker_user_prefill_input_ids) != req.talker_user_prefill_len:
+                raise RuntimeError(
+                    f"Qwen3-Omni {owner} {req.rid} has Talker prefix "
+                    f"input-id length {len(talker_user_prefill_input_ids)} "
+                    f"but expected {req.talker_user_prefill_len}"
+                )
+            req.session.set_component_kv(
+                QWEN3_OMNI_TALKER_PREFIX_COMPONENT,
+                Qwen3OmniTalkerPrefixState(
+                    kv_cache_locs=talker_user_kv_cache_locs,
+                    prefill_input_ids=talker_user_prefill_input_ids,
+                ),
+            )
+        req.talker_kv_cache_locs = None
+        req.talker_prefill_input_ids = None
+        req.talker_prefill_len = 0
+        req.talker_user_prefill_len = 0
+
+    def _store_audio_session_rebuild_state(self, req: Req):
+        if isinstance(req.finished_reason, FINISH_ABORT):
+            self.ipc_channels.send_to_detokenizer.send_output(
+                AbortReq(
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": HTTPStatus.BAD_REQUEST,
+                        "message": "Qwen3-Omni audio session rebuild aborted",
+                    },
+                    rid=req.qwen3_omni_rebuild_response_rid,
+                ),
+                req,
+            )
+            return
+
+        session = self.audio_sessions.get(req.audio_session_id)
+        if session is None:
+            raise RuntimeError(
+                f"Qwen3-Omni audio rebuild {req.rid} completed without "
+                f"audio session {req.audio_session_id}"
+            )
+        if req.session is None or not req.session.streaming:
+            raise RuntimeError(
+                f"Qwen3-Omni audio rebuild {req.rid} completed without a "
+                "streaming session"
+            )
+        if req.qwen3_omni_prompt_accept_hidden is not None:
+            req.qwen3_omni_prompt_accept_hidden = (
+                req.qwen3_omni_prompt_accept_hidden.detach()
+            )
+        self._store_talker_prefix_component_kv(
+            req, "audio rebuild", require_prefix=True
+        )
+        session.completed_turn_count = req.qwen3_omni_rebuild_turn_count
+        self.ipc_channels.send_to_detokenizer.send_output(
+            AudioSessionRebuildReqOutput(
+                rid=req.qwen3_omni_rebuild_response_rid,
+                session_id=req.audio_session_id,
+                latest_turn_rid=req.rid,
+                prefix_turn_count=req.qwen3_omni_rebuild_turn_count,
+                prompt_tokens=len(req.origin_input_ids),
+            ),
+            req,
+        )
+
+    def _qwen3_omni_tokens(self):
+        hf_config = self.model_config.hf_config
+        return (
+            hf_config.im_start_token_id,
+            hf_config.im_end_token_id,
+            hf_config.talker_config.audio_start_token_id,
+            _QWEN3_OMNI_AUDIO_END_TOKEN_ID,
+            hf_config.system_token_id,
+            hf_config.user_token_id,
+            hf_config.assistant_token_id,
+            _QWEN3_OMNI_NEWLINE_TOKEN_ID,
+        )
+
+    def _qwen3_omni_system_prefix_ids(self, system_prompt: str) -> list[int]:
+        im_start, im_end, _, _, system, _, _, newline = self._qwen3_omni_tokens()
+        return (
+            [im_start, system, newline]
+            + self.tokenizer.encode(system_prompt, add_special_tokens=False)
+            + [im_end, newline]
+        )
+
+    def _qwen3_omni_user_audio_prefix_ids(self) -> list[int]:
+        im_start, _, audio_start, _, _, user, _, newline = self._qwen3_omni_tokens()
+        return [im_start, user, newline, audio_start]
+
+    def _qwen3_omni_assistant_prefix_ids(self) -> list[int]:
+        im_start, _, _, _, _, _, assistant, newline = self._qwen3_omni_tokens()
+        return [im_start, assistant, newline]
+
+    def _qwen3_omni_audio_turn_suffix_ids(self) -> list[int]:
+        _, im_end, _, audio_end, _, _, _, newline = self._qwen3_omni_tokens()
+        return [audio_end, im_end, newline]
+
+    def _qwen3_omni_next_user_prefix_ids(
+        self, parent_ends_with_im_end: bool
+    ) -> list[int]:
+        im_start, im_end, audio_start, _, _, user, _, newline = (
+            self._qwen3_omni_tokens()
+        )
+        if parent_ends_with_im_end:
+            return [newline, im_start, user, newline, audio_start]
+        return [im_end, newline, im_start, user, newline, audio_start]
+
+    def cleanup_stale_audio_sessions(self, now: Optional[float] = None):
+        now = time.time() if now is None else now
+        expired_session_ids = [
+            session_id
+            for session_id, session in self.audio_sessions.items()
+            if session.lease_expires_at is not None and session.lease_expires_at <= now
+        ]
+        for session_id in expired_session_ids:
+            self._close_audio_session_state(session_id)
+
+    def handle_audio_session_rebuild(self, recv_req: AudioSessionRebuildReqInput):
+        sampling_params = recv_req.sampling_params
+        sampling_params.normalize(self.tokenizer)
+        sampling_params.max_new_tokens = 0
+
+        self._close_audio_session_state(recv_req.session_id)
+
+        if not recv_req.turns:
+            self.audio_sessions[recv_req.session_id] = AudioSessionState(
+                speaker=recv_req.speaker,
+            )
+            self._get_or_open_audio_streaming_session(recv_req.session_id)
+            self.ipc_channels.send_to_detokenizer.send_output(
+                AudioSessionRebuildReqOutput(
+                    rid=recv_req.rid,
+                    session_id=recv_req.session_id,
+                    latest_turn_rid="",
+                    prefix_turn_count=0,
+                    prompt_tokens=0,
+                ),
+                recv_req,
+            )
+            return None
+
+        req = Req(
+            rid=recv_req.turns[-1].turn_rid,
+            origin_input_text=recv_req.system_prompt,
+            origin_input_ids=self._qwen3_omni_system_prefix_ids(
+                recv_req.system_prompt
+            ),
+            sampling_params=sampling_params,
+            stream=False,
+            eos_token_ids=self.model_config.hf_eos_token_id,
+            vocab_size=self.model_config.vocab_size,
+            codec_eos_token_id=(
+                self.model_config.hf_config.talker_config.codec_eos_token_id
+            ),
+        )
+        req.tokenizer = self.tokenizer
+        req.audio_session_id = recv_req.session_id
+        req.speaker = recv_req.speaker
+        req.extra_key = f"audio_session_{recv_req.session_id}"
+        req.qwen3_omni_rebuild_request = True
+        req.qwen3_omni_rebuild_response_rid = recv_req.rid
+        req.qwen3_omni_rebuild_turn_count = len(recv_req.turns)
+
+        for turn_index, turn in enumerate(recv_req.turns):
+            if turn.turn_index != turn_index:
+                raise RuntimeError(
+                    "Qwen3-Omni audio rebuild turns must be contiguous and "
+                    f"ordered from zero: saw turn_index={turn.turn_index}, "
+                    f"expected={turn_index}"
+                )
+            if not turn.turn_rid:
+                raise RuntimeError(
+                    f"Qwen3-Omni audio rebuild turn {turn_index} is missing turn_rid"
+                )
+            req.origin_input_ids.extend(self._qwen3_omni_user_audio_prefix_ids())
+            for mel_features, num_frames in turn.audio_chunks:
+                self._append_audio_features_to_req(req, mel_features, num_frames)
+            req.origin_input_ids.extend(self._qwen3_omni_audio_turn_suffix_ids())
+            req.origin_input_ids.extend(self._qwen3_omni_assistant_prefix_ids())
+            req.origin_input_ids.extend(
+                self.tokenizer.encode(turn.assistant_text, add_special_tokens=False)
+            )
+            if turn_index + 1 < len(recv_req.turns):
+                _, im_end, _, _, _, _, _, newline = self._qwen3_omni_tokens()
+                req.origin_input_ids.extend([im_end, newline])
+
+        session = AudioSessionState(speaker=recv_req.speaker)
+        session.completed_turn_count = len(recv_req.turns)
+        self.audio_sessions[recv_req.session_id] = session
+        streaming_session = self._get_or_open_audio_streaming_session(
+            recv_req.session_id
+        )
+        streaming_session.attach_req(req)
+        self.waiting_queue.append(req)
+        return None
+
+    def handle_audio_turn_start(self, recv_req: AudioTurnStartReqInput):
+        sampling_params = recv_req.sampling_params
+        sampling_params.normalize(self.tokenizer)
+
+        parent_rid = recv_req.parent_rid or None
+        session = self.audio_sessions.get(recv_req.session_id)
+        if session is None:
+            if parent_rid:
+                self._abort_audio_turn_start(
+                    recv_req,
+                    (
+                        f"audio session {recv_req.session_id} not found "
+                        f"for parent_rid {parent_rid}"
+                    ),
+                )
+                return None
+            if not recv_req.system_prompt:
+                self._abort_audio_turn_start(
+                    recv_req,
+                    (
+                        "Qwen3-Omni audio turns require a Beginnings "
+                        "system_prompt when opening a new session"
+                    ),
+                )
+                return None
+            if not recv_req.speaker:
+                self._abort_audio_turn_start(
+                    recv_req,
+                    (
+                        "Qwen3-Omni audio turns require an explicit speaker "
+                        "when opening a new session"
+                    ),
+                )
+                return None
+            session = AudioSessionState(
+                speaker=recv_req.speaker,
+            )
+            self.audio_sessions[recv_req.session_id] = session
+        elif not session.speaker:
+            raise RuntimeError(
+                f"Qwen3-Omni audio session {recv_req.session_id} is missing "
+                "speaker state"
+            )
+
+        streaming_session = self._get_or_open_audio_streaming_session(
+            recv_req.session_id
+        )
+        latest_req = streaming_session.latest_req()
+        assert latest_req is not None or session.completed_turn_count == 0, (
+            f"Qwen3-Omni audio session {recv_req.session_id} has "
+            f"{session.completed_turn_count} completed turns but no streaming "
+            "session parent"
+        )
+        if latest_req is not None:
+            if parent_rid is not None and parent_rid != latest_req.rid:
+                self._abort_audio_turn_start(
+                    recv_req,
+                    (
+                        "Qwen3-Omni audio sessions are append-only; "
+                        f"parent_rid {parent_rid} is not the latest "
+                        f"turn {latest_req.rid}"
+                    ),
+                )
+                return None
+        elif parent_rid is not None:
+            self._abort_audio_turn_start(
+                recv_req,
+                (
+                    f"parent_rid {parent_rid} not found in audio session "
+                    f"{recv_req.session_id}"
+                ),
+            )
+            return None
+
+        if streaming_session._inflight:
+            self._abort_audio_turn_start(
+                recv_req,
+                (
+                    f"Qwen3-Omni audio session {recv_req.session_id} already "
+                    "has an active streaming turn"
+                ),
+            )
+            return None
+
+        parent_prompt_accept_hidden = None
+        parent_talker_kv_cache_locs = None
+        parent_talker_prefill_input_ids = None
+        if latest_req is not None:
+            parent_rid = latest_req.rid
+            parent_req = latest_req
+
+            if any(
+                token_id >= MM_PAD_SHIFT_VALUE
+                for token_id in parent_req.origin_input_ids
+            ):
+                parent_prompt_accept_hidden = (
+                    parent_req.qwen3_omni_prompt_accept_hidden
+                )
+                if parent_prompt_accept_hidden is None:
+                    self.ipc_channels.send_to_detokenizer.send_output(
+                        AbortReq(
+                            finished_reason={
+                                "type": "abort",
+                                "status_code": HTTPStatus.BAD_REQUEST,
+                                "message": (
+                                    "Qwen3-Omni audio parent turn contains multimodal "
+                                    "tokens but no retained accept-hidden state; use "
+                                    "the latest completed turn as parent_rid"
+                                ),
+                            },
+                            rid=recv_req.rid,
+                        ),
+                        recv_req,
+                    )
+                    return None
+
+            input_ids = list(parent_req.origin_input_ids) + list(parent_req.output_ids)
+            if parent_prompt_accept_hidden is not None and parent_req.output_ids:
+                output_pad = parent_prompt_accept_hidden.new_zeros(
+                    len(parent_req.output_ids), parent_prompt_accept_hidden.shape[-1]
+                )
+                parent_prompt_accept_hidden = torch.cat(
+                    [parent_prompt_accept_hidden, output_pad], dim=0
+                )
+            talker_prefix = streaming_session.pop_component_kv(
+                QWEN3_OMNI_TALKER_PREFIX_COMPONENT
+            )
+            if talker_prefix is not None:
+                parent_talker_kv_cache_locs = talker_prefix.kv_cache_locs
+                parent_talker_prefill_input_ids = talker_prefix.prefill_input_ids
+            _, im_end, _, _, _, _, _, _ = self._qwen3_omni_tokens()
+            input_ids.extend(
+                self._qwen3_omni_next_user_prefix_ids(
+                    bool(parent_req.output_ids and parent_req.output_ids[-1] == im_end)
+                )
+            )
+        else:
+            input_ids = []
+            if self.tokenizer is not None:
+                input_ids.extend(
+                    self._qwen3_omni_system_prefix_ids(recv_req.system_prompt)
+                )
+            input_ids.extend(self._qwen3_omni_user_audio_prefix_ids())
+
+        req = Req(
+            rid=recv_req.rid,
+            origin_input_text=recv_req.system_prompt or "",
+            origin_input_ids=input_ids,
+            sampling_params=sampling_params,
+            stream=True,
+            eos_token_ids=self.model_config.hf_eos_token_id,
+            vocab_size=self.model_config.vocab_size,
+            codec_eos_token_id=(
+                self.model_config.hf_config.talker_config.codec_eos_token_id
+            ),
+        )
+        req.tokenizer = self.tokenizer
+        req.is_audio_input_stream = True
+        req.audio_input_done = False
+        req.audio_input_suffix_added = False
+        req.audio_input_chunk_idx = 0
+        req.qwen3_omni_stream_prefill_ready_at = 0.0
+        req.audio_session_id = recv_req.session_id
+        req.speaker = session.speaker
+        req.extra_key = f"audio_session_{recv_req.session_id}"
+        req.qwen3_omni_prompt_accept_hidden = parent_prompt_accept_hidden
+        req.talker_kv_cache_locs = parent_talker_kv_cache_locs
+        req.talker_prefill_input_ids = parent_talker_prefill_input_ids
+        if parent_talker_kv_cache_locs is not None:
+            req.talker_prefill_len = len(parent_talker_kv_cache_locs)
+            req.talker_user_prefill_len = req.talker_prefill_len
+        streaming_session.attach_req(req)
+
+        self.audio_turn_reqs[req.rid] = req
+        added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
+        if not added_to_grammar_queue:
+            self.waiting_queue.append(req)
+        return None
+
+    def _append_audio_features_to_req(
+        self,
+        req: Req,
+        mel_features: torch.Tensor,
+        num_frames: int,
+    ):
+        mm_item = MultimodalDataItem(modality=Modality.AUDIO, feature=mel_features)
+        mel_num_frames = mel_features.shape[-1]
+        mm_item.feature_attention_mask = torch.zeros(
+            1, mel_num_frames, dtype=torch.long
+        )
+        mm_item.feature_attention_mask[0, :num_frames] = 1
+        mm_item.set_pad_value()
+
+        start_pos = len(req.origin_input_ids)
+        req.origin_input_ids.extend(
+            [mm_item.pad_value] * get_audio_token_count(num_frames)
+        )
+        mm_item.offsets = [(start_pos, len(req.origin_input_ids) - 1)]
+
+        if req.multimodal_inputs is None:
+            req.multimodal_inputs = MultimodalInputs(mm_items=[mm_item])
+        else:
+            req.multimodal_inputs.mm_items.append(mm_item)
+
+    def _enqueue_audio_req_if_idle(self, req: Req):
+        if (
+            not req.audio_input_prefill_inflight
+            and req not in self.waiting_queue
+            and req not in self.grammar_manager.grammar_queue
+        ):
+            self.waiting_queue.append(req)
+
+    def handle_audio_input_chunk(self, recv_req: AudioInputChunkReqInput):
+        req = self.audio_turn_reqs.get(recv_req.rid)
+        if req is None:
+            logger.warning("Audio input chunk for unknown rid: %s", recv_req.rid)
+            return None
+        if not req.is_audio_input_stream:
+            logger.warning("Audio input chunk for closed turn: %s", recv_req.rid)
+            return None
+
+        assert req.audio_session_id, f"audio req {req.rid} missing session id"
+
+        self._append_audio_features_to_req(
+            req,
+            recv_req.mel_features,
+            recv_req.num_frames,
+        )
+        req.audio_input_chunk_idx += 1
+        stream_prefill_bucket_s = AUDIO_STREAM_PREFILL_BATCH_DELAY_MS / 1000.0
+        now = time.perf_counter()
+        req.qwen3_omni_stream_prefill_ready_at = (
+            (int(now / stream_prefill_bucket_s) + 1) * stream_prefill_bucket_s
+        )
+        self._enqueue_audio_req_if_idle(req)
+        return None
+
+    def handle_audio_input_end(self, recv_req: AudioInputEndReqInput):
+        req = self.audio_turn_reqs.get(recv_req.rid)
+        if req is None:
+            logger.warning("Audio input end for unknown rid: %s", recv_req.rid)
+            return None
+
+        req.audio_input_done = True
+        req.is_audio_input_stream = False
+        req.qwen3_omni_stream_prefill_ready_at = 0.0
+
+        if recv_req.final_mel_features is not None and recv_req.final_num_frames > 0:
+            self._append_audio_features_to_req(
+                req,
+                recv_req.final_mel_features,
+                recv_req.final_num_frames,
+            )
+
+        if not req.audio_input_suffix_added:
+            req.origin_input_ids.extend(
+                self._qwen3_omni_audio_turn_suffix_ids()
+                + self._qwen3_omni_assistant_prefix_ids()
+            )
+            req.audio_input_suffix_added = True
+
+        self._enqueue_audio_req_if_idle(req)
+        return None
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:

@@ -1,0 +1,119 @@
+syntax = "proto3";
+
+package sglang.grpc.qwen3_omni;
+
+// Thin, async-pipeline-oriented Qwen3-Omni audio API.
+//
+// The client owns the turn stream. The server converts input events into
+// scheduler audio-turn messages, then emits ordered text/audio/terminal events.
+service Qwen3OmniAudio {
+  rpc AudioTurn(stream AudioTurnRequest) returns (stream AudioTurnEvent);
+  rpc RebuildAudioSession(stream RebuildAudioSessionRequest)
+      returns (RebuildAudioSessionResponse);
+  rpc CloseAudioSession(CloseAudioSessionRequest)
+      returns (CloseAudioSessionResponse);
+  rpc HeartbeatAudioSession(HeartbeatAudioSessionRequest)
+      returns (HeartbeatAudioSessionResponse);
+}
+
+message AudioTurnConfig {
+  string request_id = 1;
+  string session_id = 2;
+  string parent_rid = 3;
+  string system_prompt = 4;
+  string speaker = 5;
+  string sampling_params_json = 6;
+}
+
+message AudioTurnRequest {
+  oneof event {
+    AudioTurnConfig config = 1;
+    bytes pcm16_audio = 2;
+    bool end_of_input = 3;
+    string abort_reason = 4;
+  }
+}
+
+message AudioTurnComplete {
+  string turn_rid = 1;
+  string full_text = 2;
+  int32 prompt_tokens = 3;
+  int32 completion_tokens = 4;
+  int32 thinker_token_count = 5;
+  int32 talker_token_count = 6;
+}
+
+message AudioTurnError {
+  string code = 1;
+  string message = 2;
+}
+
+message AudioTurnEvent {
+  string request_id = 1;
+
+  oneof event {
+    string text_delta = 2;
+    bytes pcm16_audio = 3;
+    AudioTurnComplete complete = 4;
+    AudioTurnError error = 5;
+  }
+}
+
+message RebuildAudioSessionConfig {
+  string request_id = 1;
+  string session_id = 2;
+  string system_prompt = 3;
+  string speaker = 4;
+  string sampling_params_json = 5;
+}
+
+message RebuildAudioSessionUserAudio {
+  int32 turn_index = 1;
+  bytes pcm16_audio = 2;
+}
+
+message RebuildAudioSessionAssistantText {
+  int32 turn_index = 1;
+  string turn_rid = 2;
+  string text = 3;
+}
+
+message RebuildAudioSessionRequest {
+  oneof event {
+    RebuildAudioSessionConfig config = 1;
+    RebuildAudioSessionUserAudio user_audio = 2;
+    RebuildAudioSessionAssistantText assistant_text = 3;
+  }
+}
+
+message RebuildAudioSessionResponse {
+  bool success = 1;
+  string message = 2;
+  string latest_turn_rid = 3;
+  int32 prefix_turn_count = 4;
+  int32 prompt_tokens = 5;
+}
+
+message CloseAudioSessionRequest {
+  string session_id = 1;
+  string reason = 2;
+}
+
+message CloseAudioSessionResponse {
+  bool success = 1;
+  string message = 2;
+  int32 turn_count = 3;
+  int32 active_request_count = 4;
+}
+
+message HeartbeatAudioSessionRequest {
+  string session_id = 1;
+  string lease_token = 2;
+  int32 ttl_secs = 3;
+}
+
+message HeartbeatAudioSessionResponse {
+  bool success = 1;
+  string message = 2;
+  double lease_expires_at_unix = 3;
+}
