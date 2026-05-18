@@ -1464,7 +1464,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
         self.is_mrope_enabled = "mrope_section" in rope_config
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        if self.visual is not None:
+            self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
@@ -1567,6 +1568,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 break
             else:
                 if "visual" in name:
+                    if self.config.language_only:
+                        continue
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
                     name = name.replace(r"model.visual.", r"visual.")
@@ -1617,7 +1620,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
         self.is_mrope_enabled = "mrope_section" in rope_config
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        if self.visual is not None:
+            self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.num_fused_shared_experts = 0
         if _use_aiter:
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
@@ -1940,6 +1944,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         continue
 
                     if "visual" in name:
+                        if self.config.language_only:
+                            continue
                         # adapt to VisionAttention
                         name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
                         name = name.replace(r"model.visual.", r"visual.")

@@ -778,6 +778,7 @@ class ServerArgs:
     # Encode prefill disaggregation
     encoder_only: bool = False
     language_only: bool = False
+    qwen3_5_text_only: bool = False
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
     encoder_urls: List[str] = dataclasses.field(default_factory=list)
     enable_adaptive_dispatch_to_encoder: bool = False
@@ -3721,6 +3722,10 @@ class ServerArgs:
             raise ValueError(
                 "--enable-prefix-mm-cache requires --encoder-only to be enabled"
             )
+        if self.qwen3_5_text_only and (self.encoder_only or self.language_only):
+            raise ValueError(
+                "--qwen3-5-text-only cannot be combined with --encoder-only or --language-only"
+            )
         if self.encoder_only and self.language_only:
             raise ValueError("Cannot set --encoder-only and --language-only together")
         if self.encoder_only and not self.disaggregation_mode == "null":
@@ -6553,6 +6558,11 @@ class ServerArgs:
             "--language-only",
             action="store_true",
             help="For VLM, load weights for the language model only.",
+        )
+        parser.add_argument(
+            "--qwen3-5-text-only",
+            action="store_true",
+            help="For Qwen3.5 VLMs, serve local text-only inference without building or loading the visual stack.",
         )
         parser.add_argument(
             "--encoder-transfer-backend",

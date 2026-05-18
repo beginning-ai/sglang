@@ -65,7 +65,37 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
     }
-    conv_dtype = dtype_map.get(envs.SGLANG_MAMBA_CONV_DTYPE.get(), torch.bfloat16)
+    config_conv_dtype = None
+    if config is not None:
+        if hasattr(config, "text_config"):
+            config_conv_dtype = getattr(
+                config.text_config, "sglang_runtime_dtype", None
+            )
+            if config_conv_dtype is None:
+                config_conv_dtype = getattr(config, "sglang_runtime_dtype", None)
+        if config_conv_dtype is None and hasattr(config, "text_config"):
+            config_conv_dtype = getattr(config.text_config, "torch_dtype", None)
+            if config_conv_dtype is None:
+                config_conv_dtype = getattr(config.text_config, "dtype", None)
+        if config_conv_dtype is None:
+            config_conv_dtype = getattr(config, "sglang_runtime_dtype", None)
+        if config_conv_dtype is None:
+            config_conv_dtype = getattr(config, "torch_dtype", None)
+        if config_conv_dtype is None:
+            config_conv_dtype = getattr(config, "dtype", None)
+        if isinstance(config_conv_dtype, str):
+            config_conv_dtype = dtype_map[config_conv_dtype]
+
+    env_conv_dtype = (
+        envs.SGLANG_MAMBA_CONV_DTYPE.get()
+        if envs.SGLANG_MAMBA_CONV_DTYPE.is_set()
+        else None
+    )
+    conv_dtype = (
+        dtype_map[env_conv_dtype]
+        if env_conv_dtype is not None
+        else config_conv_dtype or torch.bfloat16
+    )
 
     # Get SSM dtype: default -> config -> env var
     ssm_dtype = torch.float32  # Step 1: Default value

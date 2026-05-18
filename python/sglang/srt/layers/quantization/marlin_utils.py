@@ -446,12 +446,8 @@ def should_use_atomic_add_reduce(
     if n >= 2048 or k < 2048 or device.type != "cuda":
         return False
 
-    # disable atomicAdd reduce by default,
-    # one can enable it with VLLM_MARLIN_USE_ATOMIC_ADD=1
-    # TODO: Need to add sglang's MARLIN_USE_ATOMIC_ADD: bool = False
-    if not True:
-        maybe_warn_marlin_atomic_add_env()
-        return False
+    maybe_warn_marlin_atomic_add_env()
+    return False
 
     # sm8x doesn't support atomicAdd + bfloat16 natively
     device_capability = torch.cuda.get_device_capability(device)

@@ -1095,16 +1095,21 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.quant_config = quant_config
 
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.skip_visual = bool(getattr(config, "qwen3_5_text_only", False))
 
-        self.visual = Qwen3VLMoeVisionModel(
-            config.vision_config,
-            # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=None,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("model.visual", prefix),
-            use_data_parallel=self.use_data_parallel,
-        )
+        if self.skip_visual:
+            print("Qwen3.5 text-only mode enabled; skipping visual tower init.")
+            self.visual = None
+        else:
+            self.visual = Qwen3VLMoeVisionModel(
+                config.vision_config,
+                # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+                quant_config=None,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                prefix=add_prefix("model.visual", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
 
         # TODO: make it more elegant
         if language_model_cls is Qwen3LLMModel:
@@ -1158,7 +1163,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # deepstack
         self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-        self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+        self.use_deepstack = {
+            Modality.IMAGE: not self.skip_visual,
+            Modality.VIDEO: not self.skip_visual,
+        }
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
@@ -1256,7 +1264,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
         """
-        if self.is_mrope_enabled:
+        if self.is_mrope_enabled and forward_batch.mrope_positions is not None:
             positions = forward_batch.mrope_positions
 
         if not (

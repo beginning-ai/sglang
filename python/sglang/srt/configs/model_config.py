@@ -23,6 +23,7 @@ from typing import Any, List, Optional, Set, Union
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.qwen3_5 import is_qwen3_5_conditional_generation_arch
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
@@ -173,6 +174,7 @@ class ModelConfig:
         is_multi_layer_eagle: bool = False,
         encoder_only: bool = False,
         language_only: bool = False,
+        qwen3_5_text_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
     ) -> None:
@@ -213,6 +215,13 @@ class ModelConfig:
             revision=revision,
             **kwargs,
         )
+        self.is_qwen3_5_text_only = qwen3_5_text_only
+        if qwen3_5_text_only and not is_qwen3_5_conditional_generation_arch(
+            self.hf_config.architectures
+        ):
+            raise ValueError(
+                "--qwen3-5-text-only requires a Qwen3.5 conditional generation architecture"
+            )
 
         # Set enable_multimodal
         if enable_multimodal is None:
@@ -221,7 +230,9 @@ class ModelConfig:
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
             ]
-            if (
+            if self.is_qwen3_5_text_only:
+                enable_multimodal = False
+            elif (
                 self.hf_config.architectures[0] in mm_disabled_models
                 and self.model_impl != ModelImpl.TRANSFORMERS
             ):
@@ -241,6 +252,8 @@ class ModelConfig:
                 )
             else:
                 enable_multimodal = True
+        elif self.is_qwen3_5_text_only:
+            enable_multimodal = False
 
         # Config draft model
         self._config_draft_model()
@@ -332,6 +345,8 @@ class ModelConfig:
             or is_deepseek_nsa(self.hf_text_config)
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
+        self.hf_config.sglang_runtime_dtype = self.dtype
+        self.hf_text_config.sglang_runtime_dtype = self.dtype
 
         # Derive context length and model shapes
         self._derive_context_length(context_length)
@@ -359,7 +374,8 @@ class ModelConfig:
         ) or getattr(self.hf_config, "image_token_index", None)
 
         self.hf_config.encoder_only = encoder_only
-        self.hf_config.language_only = language_only
+        self.hf_config.language_only = language_only or self.is_qwen3_5_text_only
+        self.hf_config.qwen3_5_text_only = self.is_qwen3_5_text_only
 
         # matryoshka embeddings
         self.matryoshka_dimensions = getattr(
@@ -404,6 +420,7 @@ class ModelConfig:
             is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
+            qwen3_5_text_only=server_args.qwen3_5_text_only,
             is_draft_model=is_draft_model,
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             model_config_parser=server_args.model_config_parser,
@@ -467,11 +484,11 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
-        if is_draft_model and self.hf_config.architectures[0] in [
-            "Qwen3_5ForConditionalGeneration",
-            "Qwen3_5MoeForConditionalGeneration",
-            "InternS2PreviewForConditionalGeneration",
-        ]:
+        if is_draft_model and (
+            is_qwen3_5_conditional_generation_arch([self.hf_config.architectures[0]])
+            or self.hf_config.architectures[0]
+            == "InternS2PreviewForConditionalGeneration"
+        ):
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 

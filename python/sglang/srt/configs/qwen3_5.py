@@ -1,7 +1,30 @@
+from typing import Any, Iterable
+
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
+from sglang.srt.multimodal.mm_utils import has_valid_data
+
+QWEN3_5_CONDITIONAL_GENERATION_ARCHS = (
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
+)
+
+
+def is_qwen3_5_conditional_generation_arch(architectures: Iterable[str]) -> bool:
+    return any(arch in QWEN3_5_CONDITIONAL_GENERATION_ARCHS for arch in architectures)
+
+
+def get_qwen3_5_text_only_mm_modalities(request_obj: Any) -> list[str]:
+    modalities = []
+    if has_valid_data(getattr(request_obj, "image_data", None)):
+        modalities.append("image")
+    if has_valid_data(getattr(request_obj, "video_data", None)):
+        modalities.append("video")
+    if has_valid_data(getattr(request_obj, "audio_data", None)):
+        modalities.append("audio")
+    return modalities
 
 
 class Qwen3_5VisionConfig(Qwen3VLVisionConfig):

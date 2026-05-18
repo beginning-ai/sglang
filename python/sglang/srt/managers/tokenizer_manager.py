@@ -40,6 +40,7 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.qwen3_5 import get_qwen3_5_text_only_mm_modalities
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -522,6 +523,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        self._crash_on_qwen3_5_text_only_multimodal_payload(obj)
         self._set_default_priority(obj)
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
@@ -2754,6 +2756,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and self.default_priority_value is not None
         ):
             obj.priority = self.default_priority_value
+
+    def _crash_on_qwen3_5_text_only_multimodal_payload(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        if not self.model_config.is_qwen3_5_text_only or not obj.contains_mm_input():
+            return
+
+        modalities = get_qwen3_5_text_only_mm_modalities(obj)
+        message = (
+            "Qwen3.5 text-only mode received a multimodal payload "
+            f"({', '.join(modalities)}). This server is configured to skip multimodal "
+            "processing entirely, so treating that request as plain text would "
+            "silently drop user inputs. Crashing the server to fail fast."
+        )
+        logger.critical(message)
+        if self._subprocess_watchdog is not None:
+            self._subprocess_watchdog.stop()
+        self.dump_requests_before_crash()
+        kill_process_tree(os.getpid(), include_parent=True)
+        raise RuntimeError(message)
 
 
 class ServerStatus(Enum):
