@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from prometheus_client import CollectorRegistry
+
+
+QWEN3_OMNI_AUDIO_REGISTRY = CollectorRegistry(auto_describe=True)
 
 TURN_LATENCY_BUCKETS = (
     0.5,
@@ -55,6 +59,7 @@ def _tokens_total():
             name="sglang:qwen3_omni_audio_tokens_total",
             documentation="Qwen3-Omni audio-path token counts by component and phase.",
             labelnames=("model_name", "component", "phase"),
+            registry=QWEN3_OMNI_AUDIO_REGISTRY,
         )
     return _TOKENS_TOTAL
 
@@ -87,18 +92,21 @@ class Qwen3OmniAudioMetrics:
             name="sglang:qwen3_omni_audio_turns_total",
             documentation="Number of Qwen3-Omni audio turns processed.",
             labelnames=[*self.labels.keys(), "status"],
+            registry=QWEN3_OMNI_AUDIO_REGISTRY,
         )
         self.turn_latency_seconds = Histogram(
             name="sglang:qwen3_omni_audio_turn_latency_seconds",
             documentation="Qwen3-Omni AudioTurn latency from config to terminal event.",
             labelnames=[*self.labels.keys(), "status"],
             buckets=TURN_LATENCY_BUCKETS,
+            registry=QWEN3_OMNI_AUDIO_REGISTRY,
         )
         self.first_audio_latency_seconds = Histogram(
             name="sglang:qwen3_omni_audio_first_audio_latency_seconds",
             documentation="Qwen3-Omni AudioTurn latency from EOI to first audio chunk.",
             labelnames=self.labels.keys(),
             buckets=FIRST_AUDIO_LATENCY_BUCKETS,
+            registry=QWEN3_OMNI_AUDIO_REGISTRY,
         )
 
     def observe_turn(self, status: str, latency_seconds: float):

@@ -258,12 +258,18 @@ def _add_metrics_routes(app):
         CONTENT_TYPE_LATEST,
         generate_latest,
     )
+    from sglang.srt.observability.qwen3_omni_audio_metrics import (
+        QWEN3_OMNI_AUDIO_REGISTRY,
+    )
 
     async def metrics_handler(request):
         try:
             registry = CollectorRegistry()
             multiprocess.MultiProcessCollector(registry)
             data = generate_latest(registry)
+            qwen3_omni_data = generate_latest(QWEN3_OMNI_AUDIO_REGISTRY)
+            if qwen3_omni_data != b"# EOF\n":
+                data = data.removesuffix(b"# EOF\n") + qwen3_omni_data
             return web.Response(
                 body=data,
                 headers={"Content-Type": CONTENT_TYPE_LATEST},

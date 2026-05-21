@@ -40,11 +40,11 @@ from typing import Any, Dict, List, Optional, Sequence
 # ---------------- AMD remote layout ----------------
 # Hot Aisle MI300X validation target used for launch qualification.
 AMD_HOST = "hotaisle@23.183.40.79"
-AMD_CONTAINER = "path1-aiter-debug"
+AMD_CONTAINER = "qwen3-omni-voice"
 AMD_SGLANG = "/sgl-workspace/sglang"
 AMD_PYTHON = "/opt/venv/bin/python"
 AMD_TMP = "/tmp"
-SERVER_PORT = 41012
+SERVER_PORT = 30000
 DEFAULT_SERVER_MODEL_PATH = (
     "/mnt/data/bai_weights/lucy-1-text-sft-fp8-thinker-talker-attn-sglang-v1"
 )
