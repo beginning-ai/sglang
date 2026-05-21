@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 import uuid
 
 import grpc
@@ -20,6 +21,10 @@ from sglang.srt.managers.io_struct import (
     AudioTurnStartReqInput,
     CloseAudioSessionReqInput,
     HeartbeatAudioSessionReqInput,
+)
+from sglang.srt.observability.qwen3_omni_audio_metrics import (
+    Qwen3OmniAudioMetrics,
+    observe_qwen3_omni_audio_tokens,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -46,6 +51,9 @@ class Qwen3OmniAudioServicer(audio_pb2_grpc.Qwen3OmniAudioServicer):
         self.max_concurrent_audio_turns = (
             server_args.qwen3_omni_max_concurrent_audio_turns
         )
+        self.metrics = (
+            Qwen3OmniAudioMetrics(server_args) if server_args.enable_metrics else None
+        )
         assert (
             self.max_concurrent_audio_turns is None
             or self.max_concurrent_audio_turns >= 0
@@ -55,6 +63,8 @@ class Qwen3OmniAudioServicer(audio_pb2_grpc.Qwen3OmniAudioServicer):
         rid = None
         audio_buffer = None
         output_started = False
+        turn_start_time = time.monotonic()
+        eoi_time = None
 
         try:
             async for request in request_iterator:
@@ -81,6 +91,10 @@ class Qwen3OmniAudioServicer(audio_pb2_grpc.Qwen3OmniAudioServicer):
                                     f"{self.max_concurrent_audio_turns} active turns"
                                 ),
                             ),
+                        )
+                        self._observe_audio_turn(
+                            "resource_exhausted",
+                            time.monotonic() - turn_start_time,
                         )
                         return
                     logger.info(
@@ -133,7 +147,10 @@ class Qwen3OmniAudioServicer(audio_pb2_grpc.Qwen3OmniAudioServicer):
                         )
                     )
                     output_started = True
-                    async for output in self._stream_audio_output(rid, context):
+                    eoi_time = time.monotonic()
+                    async for output in self._stream_audio_output(
+                        rid, context, turn_start_time, eoi_time
+                    ):
                         yield output
                     break
                 elif event == "abort_reason":
@@ -144,7 +161,10 @@ class Qwen3OmniAudioServicer(audio_pb2_grpc.Qwen3OmniAudioServicer):
                         request.abort_reason or "Request aborted",
                     )
                     output_started = True
-                    async for output in self._stream_audio_output(rid, context):
+                    eoi_time = time.monotonic()
+                    async for output in self._stream_audio_output(
+                        rid, context, turn_start_time, eoi_time
+                    ):
                         yield output
                     break
                 else:
@@ -156,6 +176,9 @@ class Qwen3OmniAudioServicer(audio_pb2_grpc.Qwen3OmniAudioServicer):
             if rid is not None and not output_started:
                 await self.request_manager._send_to_scheduler(AbortReq(rid=rid))
                 self.audio_manager.cleanup(rid)
+                self._observe_audio_turn(
+                    "client_closed", time.monotonic() - turn_start_time
+                )
         except grpc.aio.AbortError:
             raise
         except Exception as e:
@@ -163,11 +186,17 @@ class Qwen3OmniAudioServicer(audio_pb2_grpc.Qwen3OmniAudioServicer):
             if rid is not None:
                 await self.request_manager._send_to_scheduler(AbortReq(rid=rid))
                 self.audio_manager.cleanup(rid)
+            self._observe_audio_turn(
+                "internal_error", time.monotonic() - turn_start_time
+            )
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
-    async def _stream_audio_output(self, rid: str, context):
+    async def _stream_audio_output(
+        self, rid: str, context, turn_start_time: float, eoi_time: float
+    ):
         state = self.audio_manager.rid_to_state.get(rid)
         if state is None:
+            self._observe_audio_turn("aborted", time.monotonic() - turn_start_time)
             yield audio_pb2.AudioTurnEvent(
                 request_id=rid,
                 error=audio_pb2.AudioTurnError(
@@ -176,14 +205,19 @@ class Qwen3OmniAudioServicer(audio_pb2_grpc.Qwen3OmniAudioServicer):
                 ),
             )
             return
+        first_audio_observed = False
         while True:
             if context.cancelled():
                 await self.request_manager._send_to_scheduler(AbortReq(rid=rid))
+                self._observe_audio_turn(
+                    "cancelled", time.monotonic() - turn_start_time
+                )
                 break
 
             output = await state.out_queue.get()
             error = output.get("error")
             if error is not None:
+                self._observe_audio_turn("aborted", time.monotonic() - turn_start_time)
                 yield audio_pb2.AudioTurnEvent(
                     request_id=rid,
                     error=audio_pb2.AudioTurnError(
@@ -201,6 +235,9 @@ class Qwen3OmniAudioServicer(audio_pb2_grpc.Qwen3OmniAudioServicer):
                 )
 
             for chunk in output.get("audio_chunks", []):
+                if not first_audio_observed:
+                    first_audio_observed = True
+                    self._observe_first_audio(time.monotonic() - eoi_time)
                 yield audio_pb2.AudioTurnEvent(
                     request_id=rid,
                     pcm16_audio=chunk,
@@ -208,6 +245,7 @@ class Qwen3OmniAudioServicer(audio_pb2_grpc.Qwen3OmniAudioServicer):
 
             if output.get("finished"):
                 meta = output.get("meta_info", {})
+                self._observe_audio_tokens(meta)
                 yield audio_pb2.AudioTurnEvent(
                     request_id=rid,
                     complete=audio_pb2.AudioTurnComplete(
@@ -219,9 +257,37 @@ class Qwen3OmniAudioServicer(audio_pb2_grpc.Qwen3OmniAudioServicer):
                         talker_token_count=meta.get("talker_token_count", 0),
                     ),
                 )
+                self._observe_audio_turn(
+                    "finished", time.monotonic() - turn_start_time
+                )
                 break
 
         self.audio_manager.cleanup(rid)
+
+    def _observe_audio_turn(self, status: str, latency_seconds: float):
+        if self.metrics is not None:
+            self.metrics.observe_turn(status, latency_seconds)
+
+    def _observe_first_audio(self, latency_seconds: float):
+        if self.metrics is not None:
+            self.metrics.observe_first_audio(latency_seconds)
+
+    def _observe_audio_tokens(self, meta: dict):
+        observe_qwen3_omni_audio_tokens(
+            self.server_args, "thinker", "prefill", meta["prompt_tokens"]
+        )
+        observe_qwen3_omni_audio_tokens(
+            self.server_args,
+            "thinker",
+            "prefill_compute",
+            meta["prompt_tokens"] - meta["cached_tokens"],
+        )
+        observe_qwen3_omni_audio_tokens(
+            self.server_args, "thinker", "decode", meta["thinker_token_count"]
+        )
+        observe_qwen3_omni_audio_tokens(
+            self.server_args, "talker", "decode", meta["talker_token_count"]
+        )
 
     async def CloseAudioSession(self, request, context):
         rid = f"close-audio-session-{uuid.uuid4().hex}"

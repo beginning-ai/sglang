@@ -33,6 +33,10 @@ from sglang.srt.managers.utils import (
     Qwen3OmniTalkerDecodePayload,
     Qwen3OmniTalkerPrefillPayload,
 )
+from sglang.srt.observability.qwen3_omni_audio_metrics import (
+    count_qwen3_omni_tokens,
+    observe_qwen3_omni_audio_tokens,
+)
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
         GenerationBatchResult,
@@ -3030,6 +3034,16 @@ class SchedulerQwen3OmniMixin:
                         name: f"{value:.2f}"
                         for name, value in audio_phase_metrics.items()
                     }
+                )
+            if item.phase == "talker_prefill":
+                observe_qwen3_omni_audio_tokens(
+                    self.server_args,
+                    "talker",
+                    "prefill_compute",
+                    sum(
+                        count_qwen3_omni_tokens(input_ids)
+                        for input_ids in item.payload.talker_prefill_input_ids_list
+                    ),
                 )
             if item.phase == "talker_decode":
                 phase_reqs = [item.reqs[req_idx] for req_idx in item.request_indices]
