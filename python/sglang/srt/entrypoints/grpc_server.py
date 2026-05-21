@@ -10,6 +10,7 @@ once the gRPC request manager is ready, regardless of whether --enable-metrics
 is set.
 """
 
+import asyncio
 import inspect
 import json
 import logging
@@ -480,34 +481,64 @@ async def serve_grpc(server_args, model_info=None):
                 exc_info=True,
             )
 
-    # Older smg-grpc-servicer releases (≤ 0.5.2) accept only (server_args,
-    # model_info) and reject the on_request_manager_ready hook. The hook is
-    # what calls _start_sidecar_server, so dropping the kwarg disables the
-    # entire HTTP sidecar (Prometheus /metrics and /start_profile +
-    # /stop_profile). Core gRPC serving still works without it.
+    # Published smg-grpc-servicer releases through 0.5.3 accept only
+    # (server_args, model_info) and reject the on_request_manager_ready hook.
+    # Patch the servicer class in that case so the sidecar still starts when the
+    # request manager becomes available.
     serve_kwargs: dict = {}
     sidecar_supported = (
         "on_request_manager_ready" in inspect.signature(_serve_grpc).parameters
     )
     if sidecar_supported:
         serve_kwargs["on_request_manager_ready"] = _on_request_manager_ready
-    elif server_args.enable_metrics:
-        # User explicitly asked for metrics but the installed servicer can't
-        # start the sidecar that serves them — fail loud rather than silently
-        # produce a server with no /metrics endpoint.
-        raise RuntimeError(
-            "--enable-metrics requires smg-grpc-servicer ≥ 0.5.3 (the version "
-            "that accepts 'on_request_manager_ready'); installed version "
-            "lacks the hook so the HTTP sidecar would never start. Upgrade "
-            "smg-grpc-servicer or remove --enable-metrics."
-        )
     else:
-        logger.warning(
-            "Installed smg-grpc-servicer does not accept "
-            "'on_request_manager_ready'; HTTP sidecar disabled "
-            "(no /metrics, /start_profile, /stop_profile). "
-            "Upgrade smg-grpc-servicer to ≥ 0.5.3 to enable it."
+        from smg_grpc_proto import sglang_scheduler_pb2
+
+        original_servicer_cls = smg_grpc_server.SGLangSchedulerServicer
+        model_info_fields = (
+            sglang_scheduler_pb2.GetModelInfoResponse.DESCRIPTOR.fields_by_name
         )
+
+        class SidecarAwareSGLangSchedulerServicer(original_servicer_cls):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                asyncio.get_running_loop().create_task(
+                    _on_request_manager_ready(
+                        self.request_manager,
+                        self.server_args,
+                        self.scheduler_info,
+                    )
+                )
+
+            async def GetModelInfo(self, request, context):
+                if "default_sampling_params_json" in model_info_fields:
+                    return await super().GetModelInfo(request, context)
+
+                is_generation = self.scheduler_info.get("is_generation")
+                if is_generation is None:
+                    is_generation = not self.server_args.is_embedding
+
+                return sglang_scheduler_pb2.GetModelInfoResponse(
+                    model_path=self.server_args.model_path,
+                    tokenizer_path=self.server_args.tokenizer_path or "",
+                    is_generation=is_generation,
+                    preferred_sampling_params=self._preferred_sampling_params_json(),
+                    weight_version=self.server_args.weight_version or "",
+                    served_model_name=self.server_args.served_model_name,
+                    max_context_length=self.model_info["max_context_length"],
+                    vocab_size=self.model_info["vocab_size"],
+                    supports_vision=self.model_info["supports_vision"],
+                    model_type=self.model_info.get("model_type") or "",
+                    architectures=self.model_info.get("architectures") or [],
+                    eos_token_ids=self.model_info["eos_token_ids"],
+                    pad_token_id=self.model_info["pad_token_id"],
+                    bos_token_id=self.model_info["bos_token_id"],
+                    max_req_input_len=self.model_info["max_req_input_len"],
+                    id2label_json=self.model_info.get("id2label_json") or "",
+                    num_labels=self.model_info.get("num_labels") or 0,
+                )
+
+        smg_grpc_server.SGLangSchedulerServicer = SidecarAwareSGLangSchedulerServicer
 
     try:
         await _serve_grpc(server_args, model_info, **serve_kwargs)

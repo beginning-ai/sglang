@@ -43,6 +43,16 @@ rollback success. Mean/max RTF was 0.390/0.937, max first audio after EOI was
 were isolated outliers; p99 Talker decode was 6.60ms, p99 Code2Wav was
 13.59ms, and p99 Talker prefill was 67.1ms.
 
+The May 21 launch-lock work did not land a true HBM-bandwidth optimization.
+The accepted wins were staging, scheduling, graph coverage, and synchronization
+cleanup: current-stream async Talker codec-id staging, pinned Code2Wav windows,
+short-window Code2Wav capture, inline CodePredictor accounting, and 200ms
+stream-prefill batching. HBM activity stayed low at about 10% mean / 16% max
+while GPU busy stayed high at about 90% mean / 99% max, so the launch stack is
+not proven HBM-bandwidth-bound. Future HBM-heavy kernel work should be treated
+as post-launch capacity work unless a profile shows a specific bandwidth-bound
+kernel or memory layout issue.
+
 ## Accepted Findings
 
 - Overlap scheduling is accepted for the FP8 Thinker launch stack.
