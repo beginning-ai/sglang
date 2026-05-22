@@ -199,6 +199,8 @@ def _install_qwen3_omni_audio_service(server_args):
                                 await self.is_pause_cond.wait()
 
                     if isinstance(recv_obj, BatchTokenIDOutput):
+                        if recv_obj.load is not None:
+                            self.qwen3_omni_latest_loads = [recv_obj.load]
                         await self._handle_batch_output(recv_obj)
                     elif isinstance(recv_obj, BatchEmbeddingOutput):
                         await self._handle_embedding_output(recv_obj)
@@ -207,6 +209,7 @@ def _install_qwen3_omni_audio_service(server_args):
                     elif isinstance(recv_obj, AbortReq):
                         await self._handle_abort_req(recv_obj)
                     elif isinstance(recv_obj, GetLoadsReqOutput):
+                        self.qwen3_omni_latest_loads = [recv_obj]
                         self.get_loads_communicator.handle_recv(recv_obj)
                     elif isinstance(recv_obj, GetInternalStateReqOutput):
                         self.get_internal_state_communicator.handle_recv(recv_obj)
@@ -541,6 +544,14 @@ async def serve_grpc(server_args, model_info=None):
         model_info_fields = (
             sglang_scheduler_pb2.GetModelInfoResponse.DESCRIPTOR.fields_by_name
         )
+        from datetime import datetime, timezone
+
+        import sglang
+        from smg_grpc_servicer.sglang.servicer import (
+            _compute_aggregate_protobuf,
+            _convert_loads_to_protobuf,
+        )
+        from sglang.srt.managers.io_struct import GetLoadsReqOutput
 
         class SidecarAwareSGLangSchedulerServicer(original_servicer_cls):
             def __init__(self, *args, **kwargs):
@@ -551,6 +562,37 @@ async def serve_grpc(server_args, model_info=None):
                         self.server_args,
                         self.scheduler_info,
                     )
+                )
+
+            async def GetLoads(self, request, context):
+                loads = getattr(self.request_manager, "qwen3_omni_latest_loads", None)
+                if loads is None:
+                    max_total_num_tokens = self.scheduler_info["max_total_num_tokens"]
+                    loads = [
+                        GetLoadsReqOutput(
+                            dp_rank=0,
+                            timestamp=time.time(),
+                            num_running_reqs=0,
+                            num_waiting_reqs=0,
+                            num_used_tokens=0,
+                            num_total_tokens=0,
+                            max_total_num_tokens=max_total_num_tokens,
+                            token_usage=0.0,
+                            gen_throughput=0.0,
+                            cache_hit_rate=0.0,
+                            utilization=0.0,
+                            max_running_requests=self.server_args.max_running_requests
+                            or max_total_num_tokens,
+                        )
+                    ]
+
+                proto_loads = [_convert_loads_to_protobuf(load) for load in loads]
+                return sglang_scheduler_pb2.GetLoadsResponse(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    version=sglang.__version__,
+                    dp_rank_count=len(proto_loads),
+                    loads=proto_loads,
+                    aggregate=_compute_aggregate_protobuf(proto_loads),
                 )
 
             async def GetModelInfo(self, request, context):
