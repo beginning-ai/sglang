@@ -123,6 +123,7 @@ def _should_run_qwen3_omni_launch_prewarm(server_args) -> bool:
 def _install_qwen3_omni_audio_service(server_args):
     """Attach the local Qwen3-Omni audio service to the SMG gRPC server."""
     import zmq
+    import zmq.asyncio
     from smg_grpc_proto import sglang_scheduler_pb2_grpc
     from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
 
@@ -138,6 +139,7 @@ def _install_qwen3_omni_audio_service(server_args):
         HealthCheckOutput,
     )
     from sglang.srt.observability.req_time_stats import real_time
+    from sglang.srt.utils.network import get_zmq_socket
     from sglang.utils import get_exception_traceback
 
     from sglang.srt.grpc.audio_request_manager import (
@@ -149,11 +151,46 @@ def _install_qwen3_omni_audio_service(server_args):
     )
     from sglang.srt.grpc.qwen3_omni_audio_servicer import Qwen3OmniAudioServicer
 
+    if not getattr(GrpcRequestManager.__init__, "_qwen3_omni_control_wrapped", False):
+        original_init = GrpcRequestManager.__init__
+        original_shutdown = GrpcRequestManager.shutdown
+
+        def init_with_control_recv(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            self.recv_control_from_scheduler = get_zmq_socket(
+                self.context,
+                zmq.PULL,
+                self.port_args.tokenizer_ipc_name,
+                bind=True,
+            )
+
+        async def shutdown_with_control_recv(self):
+            control_socket = getattr(self, "recv_control_from_scheduler", None)
+            if control_socket is not None:
+                control_socket.close()
+                self.recv_control_from_scheduler = None
+            await original_shutdown(self)
+
+        init_with_control_recv._qwen3_omni_control_wrapped = True
+        shutdown_with_control_recv._qwen3_omni_control_wrapped = True
+        GrpcRequestManager.__init__ = init_with_control_recv
+        GrpcRequestManager.shutdown = shutdown_with_control_recv
+
     if not getattr(GrpcRequestManager.handle_loop, "_qwen3_omni_audio_wrapped", False):
+        async def recv_from_scheduler_outputs(self):
+            control_socket = self.recv_control_from_scheduler
+            poller = zmq.asyncio.Poller()
+            poller.register(self.recv_from_scheduler, zmq.POLLIN)
+            poller.register(control_socket, zmq.POLLIN)
+            events = dict(await poller.poll())
+            if self.recv_from_scheduler in events:
+                return await self.recv_from_scheduler.recv_pyobj()
+            return await control_socket.recv_pyobj()
+
         async def handle_loop_with_audio_responses(self):
             while not self.gracefully_exit:
                 try:
-                    recv_obj = await self.recv_from_scheduler.recv_pyobj()
+                    recv_obj = await recv_from_scheduler_outputs(self)
                     self.last_receive_tstamp = real_time()
 
                     if self.is_pause:
