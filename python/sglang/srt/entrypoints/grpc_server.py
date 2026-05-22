@@ -18,16 +18,41 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
+import grpc
+import sglang
+import zmq
 from aiohttp import web
+from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
+from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
 
+from sglang.srt.grpc.audio_request_manager import (
+    AudioStreamRequestManager,
+    install_audio_output_routing,
+)
+from sglang.srt.grpc.qwen3_omni_audio_pb2_grpc import (
+    add_Qwen3OmniAudioServicer_to_server,
+)
+from sglang.srt.grpc.qwen3_omni_audio_servicer import Qwen3OmniAudioServicer
 from sglang.srt.managers.io_struct import (
+    AbortReq,
+    AudioSessionRebuildReqOutput,
+    BatchEmbeddingOutput,
+    BatchTokenIDOutput,
+    CloseAudioSessionReqOutput,
     GetInternalStateReq,
+    GetInternalStateReqOutput,
+    GetLoadsReqOutput,
+    HeartbeatAudioSessionReqOutput,
+    HealthCheckOutput,
     ProfileReq,
     ProfileReqType,
 )
+from sglang.srt.observability.req_time_stats import real_time
 from sglang.srt.utils.common import get_bool_env_var, is_hip, kill_process_tree
+from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -83,9 +108,6 @@ def _run_qwen3_omni_launch_prewarm(server_args) -> None:
 
 
 def _wait_for_qwen3_omni_grpc_model_info(server_args) -> None:
-    import grpc
-    from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
-
     channel = grpc.insecure_channel(
         f"{server_args.host}:{server_args.port}",
         options=[
@@ -122,75 +144,11 @@ def _should_run_qwen3_omni_launch_prewarm(server_args) -> bool:
 
 def _install_qwen3_omni_audio_service(server_args):
     """Attach the local Qwen3-Omni audio service to the SMG gRPC server."""
-    import zmq
-    import zmq.asyncio
-    from smg_grpc_proto import sglang_scheduler_pb2_grpc
-    from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
-
-    from sglang.srt.managers.io_struct import (
-        AbortReq,
-        AudioSessionRebuildReqOutput,
-        BatchEmbeddingOutput,
-        BatchTokenIDOutput,
-        CloseAudioSessionReqOutput,
-        GetInternalStateReqOutput,
-        GetLoadsReqOutput,
-        HeartbeatAudioSessionReqOutput,
-        HealthCheckOutput,
-    )
-    from sglang.srt.observability.req_time_stats import real_time
-    from sglang.srt.utils.network import get_zmq_socket
-    from sglang.utils import get_exception_traceback
-
-    from sglang.srt.grpc.audio_request_manager import (
-        AudioStreamRequestManager,
-        install_audio_output_routing,
-    )
-    from sglang.srt.grpc.qwen3_omni_audio_pb2_grpc import (
-        add_Qwen3OmniAudioServicer_to_server,
-    )
-    from sglang.srt.grpc.qwen3_omni_audio_servicer import Qwen3OmniAudioServicer
-
-    if not getattr(GrpcRequestManager.__init__, "_qwen3_omni_control_wrapped", False):
-        original_init = GrpcRequestManager.__init__
-        original_shutdown = GrpcRequestManager.shutdown
-
-        def init_with_control_recv(self, *args, **kwargs):
-            original_init(self, *args, **kwargs)
-            self.recv_control_from_scheduler = get_zmq_socket(
-                self.context,
-                zmq.PULL,
-                self.port_args.tokenizer_ipc_name,
-                bind=True,
-            )
-
-        async def shutdown_with_control_recv(self):
-            control_socket = getattr(self, "recv_control_from_scheduler", None)
-            if control_socket is not None:
-                control_socket.close()
-                self.recv_control_from_scheduler = None
-            await original_shutdown(self)
-
-        init_with_control_recv._qwen3_omni_control_wrapped = True
-        shutdown_with_control_recv._qwen3_omni_control_wrapped = True
-        GrpcRequestManager.__init__ = init_with_control_recv
-        GrpcRequestManager.shutdown = shutdown_with_control_recv
-
     if not getattr(GrpcRequestManager.handle_loop, "_qwen3_omni_audio_wrapped", False):
-        async def recv_from_scheduler_outputs(self):
-            control_socket = self.recv_control_from_scheduler
-            poller = zmq.asyncio.Poller()
-            poller.register(self.recv_from_scheduler, zmq.POLLIN)
-            poller.register(control_socket, zmq.POLLIN)
-            events = dict(await poller.poll())
-            if self.recv_from_scheduler in events:
-                return await self.recv_from_scheduler.recv_pyobj()
-            return await control_socket.recv_pyobj()
-
         async def handle_loop_with_audio_responses(self):
             while not self.gracefully_exit:
                 try:
-                    recv_obj = await recv_from_scheduler_outputs(self)
+                    recv_obj = await self.recv_from_scheduler.recv_pyobj()
                     self.last_receive_tstamp = real_time()
 
                     if self.is_pause:
@@ -544,14 +502,11 @@ async def serve_grpc(server_args, model_info=None):
         model_info_fields = (
             sglang_scheduler_pb2.GetModelInfoResponse.DESCRIPTOR.fields_by_name
         )
-        from datetime import datetime, timezone
 
-        import sglang
         from smg_grpc_servicer.sglang.servicer import (
             _compute_aggregate_protobuf,
             _convert_loads_to_protobuf,
         )
-        from sglang.srt.managers.io_struct import GetLoadsReqOutput
 
         class SidecarAwareSGLangSchedulerServicer(original_servicer_cls):
             def __init__(self, *args, **kwargs):
