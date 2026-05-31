@@ -3001,10 +3001,16 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         )
 
         thinker_num_layers = config.thinker_config.text_config.num_hidden_layers
-        self._talker_quant_config = quant_config
+        talker_quant_config = quant_config
+        if quant_config is not None and quant_config.__class__.__name__ in (
+            "GPTQConfig",
+            "GPTQMarlinConfig",
+        ):
+            talker_quant_config = None
+        self._talker_quant_config = talker_quant_config
         self.talker = Qwen3OmniMoeTalkerForConditionalGeneration(
             config=config.talker_config,
-            quant_config=quant_config,
+            quant_config=talker_quant_config,
             prefix="talker",
             layer_id_offset=thinker_num_layers,
         )
