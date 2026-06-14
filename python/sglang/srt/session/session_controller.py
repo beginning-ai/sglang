@@ -422,6 +422,8 @@ class SessionController:
 
     @staticmethod
     def _all_requests_finished(session: Session) -> bool:
+        if session._inflight:
+            return False
         if not session.req_nodes:
             return True
         return all(node.req.finished() for node in session.req_nodes.values())

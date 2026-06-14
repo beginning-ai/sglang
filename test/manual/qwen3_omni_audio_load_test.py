@@ -46,6 +46,10 @@ class TurnResult:
     realtime_after_eoi: bool | None
     audio_stream_rtf_after_first_audio: float | None
     realtime_audio_stream_after_first_audio: bool | None
+    audio_rms: float | None
+    audio_peak: float | None
+    audio_near_clipped_fraction: float | None
+    audio_near_clipped_samples: int | None
     output_path: str | None
     stt_text: str | None
     stt_reference_text: str | None
@@ -99,6 +103,52 @@ def _write_wav(path: Path, pcm16_audio: bytes) -> None:
         wav_file.setsampwidth(PCM16_BYTES_PER_SAMPLE)
         wav_file.setframerate(OUTPUT_SAMPLE_RATE)
         wav_file.writeframes(pcm16_audio)
+
+
+def _audio_quality(pcm16_audio: bytes) -> tuple[float, float, float, int]:
+    samples = np.frombuffer(pcm16_audio, dtype=np.int16).astype(np.int32)
+    if samples.size == 0:
+        raise ValueError("audio quality requires non-empty PCM16 audio")
+    normalized = samples.astype(np.float64) / 32768.0
+    abs_samples = np.abs(samples)
+    rms = float(np.sqrt(np.mean(normalized * normalized)))
+    peak = float(abs_samples.max() / 32768.0)
+    near_clipped_samples = int(np.count_nonzero(abs_samples >= 32700))
+    near_clipped_fraction = near_clipped_samples / samples.size
+    return rms, peak, near_clipped_fraction, near_clipped_samples
+
+
+def _audio_sanity_error(
+    *,
+    output_audio_s: float,
+    audio_rms: float | None,
+    audio_peak: float | None,
+    audio_near_clipped_fraction: float | None,
+    args: argparse.Namespace,
+) -> str | None:
+    if output_audio_s < args.min_output_audio_s:
+        return (
+            f"audio too short output_audio_s={output_audio_s:.3f} "
+            f"min={args.min_output_audio_s:.3f}"
+        )
+    assert audio_rms is not None
+    assert audio_peak is not None
+    assert audio_near_clipped_fraction is not None
+    if audio_rms < args.min_audio_rms:
+        return f"audio RMS too low rms={audio_rms:.6f} min={args.min_audio_rms:.6f}"
+    if audio_rms > args.max_audio_rms:
+        return f"audio RMS too high rms={audio_rms:.6f} max={args.max_audio_rms:.6f}"
+    if audio_peak > args.max_audio_peak:
+        return (
+            f"audio peak too high peak={audio_peak:.6f} max={args.max_audio_peak:.6f}"
+        )
+    if audio_near_clipped_fraction > args.max_near_clipped_fraction:
+        return (
+            "audio has too many near-clipped samples "
+            f"fraction={audio_near_clipped_fraction:.8f} "
+            f"max={args.max_near_clipped_fraction:.8f}"
+        )
+    return None
 
 
 def _normalize_transcript(text: str) -> str:
@@ -172,9 +222,9 @@ async def _run_turn(
         "max_new_tokens": args.max_new_tokens,
     }
     if args.talker_max_new_tokens is not None:
-        sampling_params.setdefault("custom_params", {})[
-            "talker_max_new_tokens"
-        ] = args.talker_max_new_tokens
+        sampling_params.setdefault("custom_params", {})["talker_max_new_tokens"] = (
+            args.talker_max_new_tokens
+        )
     if args.regex:
         sampling_params["regex"] = args.regex
     custom_params = sampling_params.setdefault("custom_params", {})
@@ -270,6 +320,28 @@ async def _run_turn(
     metric_end_time = max(metric_timestamps) if metric_timestamps else response_end_time
     audio_bytes = len(output_audio)
     output_audio_s = audio_bytes / PCM16_BYTES_PER_SAMPLE / OUTPUT_SAMPLE_RATE
+    audio_rms = None
+    audio_peak = None
+    audio_near_clipped_fraction = None
+    audio_near_clipped_samples = None
+    if output_audio:
+        (
+            audio_rms,
+            audio_peak,
+            audio_near_clipped_fraction,
+            audio_near_clipped_samples,
+        ) = _audio_quality(bytes(output_audio))
+        sanity_error = _audio_sanity_error(
+            output_audio_s=output_audio_s,
+            audio_rms=audio_rms,
+            audio_peak=audio_peak,
+            audio_near_clipped_fraction=audio_near_clipped_fraction,
+            args=args,
+        )
+        if sanity_error is not None and error is None:
+            error = sanity_error
+    elif error is None:
+        error = "no audio output"
     elapsed_after_eoi = metric_end_time - eoi_time if eoi_time is not None else None
     first_audio_after_eoi = (
         first_audio_time - eoi_time
@@ -340,6 +412,10 @@ async def _run_turn(
         realtime_after_eoi=realtime_after_eoi,
         audio_stream_rtf_after_first_audio=audio_stream_rtf_after_first_audio,
         realtime_audio_stream_after_first_audio=realtime_audio_stream_after_first_audio,
+        audio_rms=audio_rms,
+        audio_peak=audio_peak,
+        audio_near_clipped_fraction=audio_near_clipped_fraction,
+        audio_near_clipped_samples=audio_near_clipped_samples,
         output_path=output_path,
         stt_text=stt_text,
         stt_reference_text=stt_reference_text,
@@ -364,6 +440,17 @@ def _aggregate(results: list[TurnResult]) -> dict:
         result.audio_stream_rtf_after_first_audio
         for result in ok_results
         if result.audio_stream_rtf_after_first_audio is not None
+    ]
+    rms_values = [
+        result.audio_rms for result in ok_results if result.audio_rms is not None
+    ]
+    peak_values = [
+        result.audio_peak for result in ok_results if result.audio_peak is not None
+    ]
+    near_clipped_values = [
+        result.audio_near_clipped_fraction
+        for result in ok_results
+        if result.audio_near_clipped_fraction is not None
     ]
     elapsed = [
         result.elapsed_after_eoi_s
@@ -397,6 +484,12 @@ def _aggregate(results: list[TurnResult]) -> dict:
         ),
         "max_elapsed_after_eoi_s": max(elapsed) if elapsed else None,
         "total_audio_bytes": sum(result.audio_bytes for result in ok_results),
+        "max_audio_rms": max(rms_values) if rms_values else None,
+        "mean_audio_rms": sum(rms_values) / len(rms_values) if rms_values else None,
+        "max_audio_peak": max(peak_values) if peak_values else None,
+        "max_audio_near_clipped_fraction": (
+            max(near_clipped_values) if near_clipped_values else None
+        ),
         "realtime_after_eoi": all(realtime_results) if realtime_results else None,
         "realtime_audio_stream_after_first_audio": (
             all(realtime_stream_results) if realtime_stream_results else None
@@ -437,6 +530,11 @@ async def _main_async(args: argparse.Namespace) -> None:
             "talker_repetition_penalty": args.talker_repetition_penalty,
             "speaker": args.speaker,
             "system_prompt_set": bool(args.system_prompt),
+            "min_output_audio_s": args.min_output_audio_s,
+            "min_audio_rms": args.min_audio_rms,
+            "max_audio_rms": args.max_audio_rms,
+            "max_audio_peak": args.max_audio_peak,
+            "max_near_clipped_fraction": args.max_near_clipped_fraction,
             "stt_command_set": bool(args.stt_command),
             "stt_max_normalized_distance": args.stt_max_normalized_distance,
         },
@@ -480,6 +578,11 @@ def main() -> None:
     parser.add_argument("--speaker", default="chelsie")
     parser.add_argument("--system-prompt", default="")
     parser.add_argument("--system-prompt-file")
+    parser.add_argument("--min-output-audio-s", type=float, default=0.25)
+    parser.add_argument("--min-audio-rms", type=float, default=0.001)
+    parser.add_argument("--max-audio-rms", type=float, default=0.35)
+    parser.add_argument("--max-audio-peak", type=float, default=0.98)
+    parser.add_argument("--max-near-clipped-fraction", type=float, default=0.00001)
     parser.add_argument(
         "--stt-command",
         help="Command that prints the STT transcript for {audio}; use Parakeet here.",
@@ -524,7 +627,9 @@ def main() -> None:
             if line.strip()
         ]
         if len(args.request_ids) != args.concurrency:
-            raise ValueError("--request-ids-file must contain exactly --concurrency IDs")
+            raise ValueError(
+                "--request-ids-file must contain exactly --concurrency IDs"
+            )
     args.session_ids = None
     if args.session_ids_file:
         args.session_ids = [
@@ -533,14 +638,28 @@ def main() -> None:
             if line.strip()
         ]
         if len(args.session_ids) != args.concurrency:
-            raise ValueError("--session-ids-file must contain exactly --concurrency IDs")
+            raise ValueError(
+                "--session-ids-file must contain exactly --concurrency IDs"
+            )
     if not 0 <= args.stt_max_normalized_distance <= 1:
         raise ValueError("--stt-max-normalized-distance must be in [0, 1]")
+    if args.min_output_audio_s <= 0:
+        raise ValueError("--min-output-audio-s must be positive")
+    if args.min_audio_rms <= 0:
+        raise ValueError("--min-audio-rms must be positive")
+    if args.max_audio_rms <= args.min_audio_rms:
+        raise ValueError("--max-audio-rms must be greater than --min-audio-rms")
+    if not 0 < args.max_audio_peak <= 1:
+        raise ValueError("--max-audio-peak must be in (0, 1]")
+    if not 0 <= args.max_near_clipped_fraction <= 1:
+        raise ValueError("--max-near-clipped-fraction must be in [0, 1]")
     if args.stt_command:
         if not args.system_prompt:
             raise ValueError("--stt-command requires Beginnings --system-prompt")
         if args.speaker != "chelsie":
-            raise ValueError("--stt-command correctness gate requires --speaker chelsie")
+            raise ValueError(
+                "--stt-command correctness gate requires --speaker chelsie"
+            )
 
     asyncio.run(_main_async(args))
 

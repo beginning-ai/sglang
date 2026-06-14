@@ -73,8 +73,7 @@ def _default_fixtures(args: argparse.Namespace) -> list[str]:
                 "HF_TOKEN is required to hydrate Qwen3-Omni prewarm fixtures"
             )
         print(
-            "[prewarm] hydrate HF fixtures "
-            f"{args.fixture_repo_id}:{args.fixture_root}",
+            f"[prewarm] hydrate HF fixtures {args.fixture_repo_id}:{args.fixture_root}",
             flush=True,
         )
         for filename in expected_files:
@@ -144,6 +143,18 @@ def _load_phase(
         f"{args.request_prefix}-bs{batch_size}",
         "--session-prefix",
         f"{args.session_prefix}-bs{batch_size}",
+        "--save-output-dir",
+        str(Path(args.output_dir) / f"load_bs{batch_size}"),
+        "--min-output-audio-s",
+        str(args.min_output_audio_s),
+        "--min-audio-rms",
+        str(args.min_audio_rms),
+        "--max-audio-rms",
+        str(args.max_audio_rms),
+        "--max-audio-peak",
+        str(args.max_audio_peak),
+        "--max-near-clipped-fraction",
+        str(args.max_near_clipped_fraction),
     ]
     if args.realtime_input:
         cmd.append("--realtime-input")
@@ -157,6 +168,8 @@ def _load_phase(
         "turns": aggregate["ok"] + aggregate["failed"],
         "max_first_audio_after_eoi_s": aggregate["max_first_audio_after_eoi_s"],
         "max_rtf_after_eoi": aggregate["max_rtf_after_eoi"],
+        "max_audio_peak": aggregate["max_audio_peak"],
+        "max_audio_near_clipped_fraction": aggregate["max_audio_near_clipped_fraction"],
     }
 
 
@@ -220,7 +233,9 @@ def _rollback_phase(args: argparse.Namespace, *, soak_script: Path) -> dict[str,
     }
 
 
-def _continuation_phase(args: argparse.Namespace, *, soak_script: Path) -> dict[str, Any]:
+def _continuation_phase(
+    args: argparse.Namespace, *, soak_script: Path
+) -> dict[str, Any]:
     output_dir = Path(args.output_dir) / "continuation"
     cmd = [
         sys.executable,
@@ -293,6 +308,11 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--talker-max-new-tokens", type=int, default=256)
     parser.add_argument("--speaker", default="chelsie")
+    parser.add_argument("--min-output-audio-s", type=float, default=0.25)
+    parser.add_argument("--min-audio-rms", type=float, default=0.001)
+    parser.add_argument("--max-audio-rms", type=float, default=0.35)
+    parser.add_argument("--max-audio-peak", type=float, default=0.98)
+    parser.add_argument("--max-near-clipped-fraction", type=float, default=0.00001)
     parser.add_argument("--request-prefix", default="qwen3-omni-prewarm")
     parser.add_argument("--session-prefix", default="qwen3-omni-prewarm")
     parser.add_argument("--continuation-sessions", type=int, default=50)
@@ -303,8 +323,21 @@ def main() -> None:
 
     if args.speaker != "chelsie":
         raise ValueError("Qwen3-Omni launch prewarm requires --speaker chelsie")
-    if args.system_prompt_file is not None and not Path(args.system_prompt_file).is_file():
+    if (
+        args.system_prompt_file is not None
+        and not Path(args.system_prompt_file).is_file()
+    ):
         raise FileNotFoundError(args.system_prompt_file)
+    if args.min_output_audio_s <= 0:
+        raise ValueError("--min-output-audio-s must be positive")
+    if args.min_audio_rms <= 0:
+        raise ValueError("--min-audio-rms must be positive")
+    if args.max_audio_rms <= args.min_audio_rms:
+        raise ValueError("--max-audio-rms must be greater than --min-audio-rms")
+    if not 0 < args.max_audio_peak <= 1:
+        raise ValueError("--max-audio-peak must be in (0, 1]")
+    if not 0 <= args.max_near_clipped_fraction <= 1:
+        raise ValueError("--max-near-clipped-fraction must be in [0, 1]")
     if args.fixture is None:
         args.fixture = _default_fixtures(args)
     args.fixture = _fixture_paths(args.fixture)
