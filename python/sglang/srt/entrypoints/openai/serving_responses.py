@@ -1389,9 +1389,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                 and merged
                 and isinstance(merged[-1], dict)
                 and merged[-1].get("role") == "assistant"
-                and merged[-1].get("phase") == msg.get("phase")
+                # Reasoning and tool-call items carry no phase: they join the
+                # adjacent turn unless it already ended in a final answer.
+                and (
+                    merged[-1].get("phase") == msg.get("phase")
+                    or None in (merged[-1].get("phase"), msg.get("phase"))
+                    and merged[-1].get("phase") != "final_answer"
+                )
             ):
                 prev = merged[-1] = dict(merged[-1])
+                prev["phase"] = prev.get("phase") or msg.get("phase")
                 # Lift mixed str/list content to list parts so non-text parts
                 # (e.g. image_url) survive when the two sides differ in shape.
                 new_content = msg.get("content")
