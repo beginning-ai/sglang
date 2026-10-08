@@ -972,8 +972,12 @@ class ExecOffload(msgspec.Struct):
             "directly; use it on unified-memory devices (e.g. GB10 / DGX Spark) "
             "where pinned host memory comes out of the same pool as the model "
             "weights. Requires a device that reports "
-            "cudaDevAttrPageableMemoryAccessUsesHostPageTables.",
-            choices=["pinned", "file"],
+            "cudaDevAttrPageableMemoryAccessUsesHostPageTables. 'nvme' keeps "
+            "only a small pinned ring resident and streams the rows each step "
+            "needs from local storage, for hosts too small to hold the table "
+            "whose device cannot dereference pageable memory; it reads "
+            "--ple-offload-dir, which defaults to the model path.",
+            choices=["pinned", "file", "nvme"],
         ),
     ] = "pinned"
     ple_offload_dir: A[

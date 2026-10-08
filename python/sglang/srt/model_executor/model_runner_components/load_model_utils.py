@@ -280,7 +280,7 @@ def load_model_with_memory_saver(
             )
             if get_exec().offload.ple_offload_backend != "file":
                 model_config.hf_text_config.ple_offload_dir = (
-                    get_exec().offload.ple_offload_dir
+                    get_exec().offload.ple_offload_dir or get_model().model_path
                 )
             else:
                 from sglang.srt.models.qwen4_exp_ple_table import (

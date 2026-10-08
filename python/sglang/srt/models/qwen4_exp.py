@@ -81,6 +81,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5LinearDecoderLayer,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.layers.ngram_row_store import open_ple_row_store
 from sglang.srt.models.qwen4_exp_ple_table import (
     allocate_ple_host_table,
     make_ple_file_prefetcher,
@@ -637,6 +638,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 ngram_embedding,
                 backend=getattr(config, "ple_offload_backend", "pinned"),
                 table_dir=getattr(config, "ple_offload_dir", None),
+                rows_per_token=self.ngram_heads,
             )
         self.ngram_embedding = ngram_embedding
 
@@ -917,6 +919,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         *,
         backend: str = "pinned",
         table_dir: Optional[str] = None,
+        rows_per_token: int = 0,
     ) -> None:
         nn.Module.__init__(self)
         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
@@ -939,17 +942,27 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.quant_method = None
 
         source_weight = embedding.weight
-        host_table = allocate_ple_host_table(
-            shape=source_weight.shape,
-            dtype=source_weight.dtype,
-            backend=backend,
-            table_dir=table_dir,
-            # Each TP rank holds a different vocabulary shard of the same shape.
-            tag=(
-                f"rows{self.shard_indices.org_vocab_start_index}"
-                f"-{self.shard_indices.org_vocab_end_index}"
-            ),
-        )
+        self._store = None
+        if backend == "nvme":
+            # The host table is a pinned ring of streamed rows (ngram_row_store).
+            if self.tp_size > 1:
+                raise NotImplementedError("the nvme PLE backend requires TP=1")
+            self._store = open_ple_row_store(
+                table_dir, *source_weight.shape, source_weight.dtype, rows_per_token
+            )
+            host_table = self._store.table
+        else:
+            host_table = allocate_ple_host_table(
+                shape=source_weight.shape,
+                dtype=source_weight.dtype,
+                backend=backend,
+                table_dir=table_dir,
+                # Each TP rank holds a different vocabulary shard of the same shape.
+                tag=(
+                    f"rows{self.shard_indices.org_vocab_start_index}"
+                    f"-{self.shard_indices.org_vocab_end_index}"
+                ),
+            )
         # Only the file backend has anything to prefetch (rows live on storage).
         self._file_prefetcher = make_ple_file_prefetcher(host_table)
         # ... and only it needs its resident set bounded: a fault maps a whole
@@ -998,6 +1011,16 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
+            vocab_start = self.shard_indices.org_vocab_start_index
+            vocab_end = self.shard_indices.org_vocab_end_index
+            if self._store is not None:
+                # Ids become ring slots. A captured graph cannot read ids back
+                # to the host: its slots are staged by prepare_graph_replay.
+                vocab_start, vocab_end = 0, self._store.capacity
+                if get_is_capture_mode() and not is_in_breakable_cuda_graph():
+                    flat_ids = self._store.capture_slots(flat_ids.shape)
+                else:
+                    flat_ids = self._store.acquire(flat_ids)
             if self._file_prefetcher is not None:
                 self._file_prefetcher.enqueue(
                     flat_ids,
@@ -1009,8 +1032,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 flat_ids,
                 output,
                 embedding_dim=self.embedding_dim,
-                tp_vocab_start=self.shard_indices.org_vocab_start_index,
-                tp_vocab_end=self.shard_indices.org_vocab_end_index,
+                tp_vocab_start=vocab_start,
+                tp_vocab_end=vocab_end,
                 is_fp8=self.weight.dtype == torch.float8_e4m3fn,
                 BLOCK_D=self._block_d,
             )
@@ -1848,6 +1871,13 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         self.ple_ngram_eos_token_id = (
             int(config.eos_token_id) if self.ple_ngram_size is not None else None
         )
+        # PLE layers whose table streams from storage (nvme backend).
+        self._streaming_ple = [
+            layer.ple
+            for layer in self.layers[self.start_layer : self.end_layer]
+            if layer.ple is not None
+            and getattr(layer.ple.ple_embedding.ngram_embedding, "_store", None)
+        ]
         if hasattr(self, "norm"):
             delattr(self, "norm")
         hc_config = HyperConnectionConfig(
@@ -1865,6 +1895,27 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         )
         # The stack's terminal read mixes the streams down; there is no final norm.
         self._mix_streams = _MixStreams(self.hyper_connection_mixer)
+
+    def prepare_graph_replay(self, forward_batch: ForwardBatch) -> None:
+        """Read the PLE rows a captured graph is about to gather.
+
+        Replay re-runs only device work, so the read happens here, after the
+        graph's inputs are loaded. ``_prepare_ple_batch`` only reads pool
+        state, so building the batch again before the forward is harmless.
+        """
+        if not self._streaming_ple:
+            return
+        batch = _prepare_ple_batch(
+            forward_batch.input_ids,
+            forward_batch,
+            ngram_size=self.ple_ngram_size,
+            ngram_eos_token_id=self.ple_ngram_eos_token_id,
+        )
+        if batch is None:
+            return
+        for ple in self._streaming_ple:
+            store = ple.ple_embedding.ngram_embedding._store
+            store.acquire(ple.ple_embedding.compute_ngram_ids(batch))
 
     def forward(
         self,
@@ -2035,6 +2086,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
 
+    def prepare_graph_replay(self, forward_batch: ForwardBatch) -> None:
+        self.model.prepare_graph_replay(forward_batch)
+
     @torch.no_grad()
     def forward(
         self,
@@ -2195,6 +2249,10 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if ple_mod is None:
                 return False
             emb = ple_mod.ngram_embedding
+            if isinstance(emb, Qwen4ExpPinnedHostEmbedding) and emb._store is not None:
+                # Streamed from the checkpoint on demand: nothing to load.
+                loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
+                return True
             if (
                 loaded_weight.dtype == torch.float8_e4m3fn
                 and emb.weight.dtype != torch.float8_e4m3fn

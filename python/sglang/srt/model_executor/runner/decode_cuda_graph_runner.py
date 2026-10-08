@@ -1496,6 +1496,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
+            # Host work a model must do before replay (e.g. reading rows it
+            # streams from storage, which a captured graph cannot).
+            prepare = getattr(self.model_runner.model, "prepare_graph_replay", None)
+            if prepare is not None:
+                prepare(forward_batch)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
