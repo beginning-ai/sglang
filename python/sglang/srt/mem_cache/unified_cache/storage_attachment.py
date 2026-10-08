@@ -141,6 +141,7 @@ class StorageAttachment:
                     sidecar_pool_specs=cache.sidecar_pool_specs,
                     host_pool_group=cache.host_pool_group,
                     swa_component=cache.components.get(ComponentType.SWA),
+                    mamba_component=cache.components.get(ComponentType.MAMBA),
                     storage_prefetch_threshold=prefetch_threshold,
                 )
             # New workers must see the requested policy from their first operation.
