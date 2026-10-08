@@ -36,6 +36,9 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
+# Byte budget per hybrid-pool bounce buffer (rows are resident from allocation).
+_BOUNCE_BYTES = 512 << 20
+
 
 def _parse_storage_dirs(raw: Optional[str]) -> List[str]:
     """Split NIXL FILE storage directory config into ordered unique paths."""
@@ -427,14 +430,21 @@ class HiCacheNixl(HiCacheStorage):
             sample = host_pool.get_dummy_flat_data_page()
             page_numel = sample.numel()
             page_bytes = page_numel * sample.element_size()
+            # The bounce rows hold flat data pages, so they take the page's dtype
+            # (bytes for Mamba), not the pool's: a mismatch makes copy_() convert
+            # values and misplaces every slot after the first.
+            page_dtype = sample.dtype
             del sample
 
+            # The rows are resident from allocation, and a Mamba page is tens
+            # of MB moved one per node, so cap the rows by bytes.
+            rows = max(1, min(STORAGE_BATCH_SIZE, _BOUNCE_BYTES // page_bytes))
             pin_memory = bool(getattr(host_pool, "pin_memory", False))
             bounce_set = self._alloc_registered(
-                page_numel, host_pool.dtype, pin_memory, f"{host_pool_name}_bounce_set"
+                page_numel, page_dtype, pin_memory, f"{host_pool_name}_bounce_set", rows
             )
             bounce_get = self._alloc_registered(
-                page_numel, host_pool.dtype, pin_memory, f"{host_pool_name}_bounce_get"
+                page_numel, page_dtype, pin_memory, f"{host_pool_name}_bounce_get", rows
             )
             self._hybrid_pool_ctx[host_pool_name] = _HybridPoolContext(
                 host_pool=host_pool,
@@ -457,6 +467,10 @@ class HiCacheNixl(HiCacheStorage):
             hasattr(host_pool, "get_page_buffer_meta")
             and hasattr(host_pool, "get_hybrid_pool_buffer")
         ):
+            return False
+        # Slot side states (e.g. a PLE n-gram history riding the Mamba slot)
+        # have no zero-copy page layout; the whole-page bounce path carries them.
+        if getattr(host_pool, "slot_state_device_tensors", ()):
             return False
         buffers = host_pool.get_hybrid_pool_buffer()
         if not buffers:
@@ -552,12 +566,12 @@ class HiCacheNixl(HiCacheStorage):
             ]
             return host_pool, key_strs, host_buffers, page_offsets, key_multiplier
 
-        if len(keys) > STORAGE_BATCH_SIZE:
+        if len(keys) > len(ctx.bounce_set):
             logger.error(
                 "HiCacheNixl: hybrid pool %s batch size %s exceeds bounce buffer capacity %s",
                 transfer.name,
                 len(keys),
-                STORAGE_BATCH_SIZE,
+                len(ctx.bounce_set),
             )
             return host_pool, [], [], [], 0
 
@@ -586,13 +600,14 @@ class HiCacheNixl(HiCacheStorage):
         dtype: torch.dtype,
         pin_memory: bool,
         kind: str,
+        rows: int = STORAGE_BATCH_SIZE,
     ) -> torch.Tensor:
-        """Allocate a ``(STORAGE_BATCH_SIZE, page_numel)`` bounce buffer and
+        """Allocate a ``(rows, page_numel)`` bounce buffer and
         pre-register it as a DRAM region with NIXL. Uses alloc_mmap so the
         buffer is page-aligned -- required when O_DIRECT is on for any
         file-based backend (POSIX/GDS/GDS_MT/3FS). pin_memory is currently
         unused (alloc_mmap does not support it)."""
-        buf = alloc_mmap((STORAGE_BATCH_SIZE, page_numel), dtype)
+        buf = alloc_mmap((rows, page_numel), dtype)
         self._pre_register_host(buf.data_ptr(), buf.numel() * buf.element_size(), kind)
         return buf
 
