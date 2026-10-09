@@ -50,6 +50,10 @@ from sglang.srt.layers.logprob_processor import (
     get_token_ids_logprobs_raw,
     get_top_logprobs_raw,
 )
+from sglang.srt.layers.quantization.decode_gemv import (
+    SCALE_ATTR as FP8_ROW_SCALE,
+    fp8_row_linear,
+)
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
 from sglang.srt.model_executor.forward_batch_info import (
@@ -969,6 +973,14 @@ class LogitsProcessor(nn.Module):
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
+        elif hasattr(getattr(lm_head, "weight", None), FP8_ROW_SCALE):
+            logits = fp8_row_linear(
+                hidden_states,
+                lm_head.weight,
+                torch.float32 if self.use_fp32_lm_head else hidden_states.dtype,
+            )
+            if embedding_bias is not None:
+                logits += embedding_bias
         elif should_apply_lm_head_quant_method(lm_head, quant_method):
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):

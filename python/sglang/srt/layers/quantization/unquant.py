@@ -31,6 +31,12 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.decode_gemv import (
+    SCALE_ATTR,
+    fp8_row_linear,
+    skinny_linear,
+    use_skinny_linear,
+)
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
     get_exec,
@@ -533,6 +539,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
+        if hasattr(layer.weight, SCALE_ATTR):
+            out = fp8_row_linear(x, layer.weight, x.dtype)
+            return out if bias is None else out + bias
+        if bias is None and use_skinny_linear(x, layer.weight):
+            return skinny_linear(x, layer.weight)
         return F.linear(x, layer.weight, bias)
 
     def apply_with_addend(

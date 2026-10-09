@@ -223,6 +223,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
+    get_bool_env_var,
     is_host_cpu_arm64,
     is_npu,
     require_gathered_buffer,
@@ -775,6 +776,13 @@ class ModelRunner:
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if get_parallel().tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
+        if get_bool_env_var("SGLANG_FP8_ROW_WEIGHTS"):
+            from sglang.srt.layers.quantization.decode_gemv import (
+                quantize_fp8_row_weights,
+            )
+
+            # A draft gets the target's head (or rows of it) after loading.
+            quantize_fp8_row_weights(self.model, is_draft=self.is_draft_worker)
 
     def maybe_init_lora_manager(self):
         if self.spec_algorithm.is_uno():

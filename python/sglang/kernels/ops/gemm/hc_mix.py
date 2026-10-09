@@ -28,6 +28,8 @@ def _hc_mix_persistent_kernel(
     x_ptr,
     w_down_ptr,
     w_up_ptr,
+    s_down_ptr,
+    s_up_ptr,
     t_raw_ptr,
     out_ptr,
     counters_ptr,
@@ -43,6 +45,7 @@ def _hc_mix_persistent_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_J: tl.constexpr,
     BLOCK_R: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs_m = tl.arange(0, ROWS)
@@ -75,7 +78,9 @@ def _hc_mix_persistent_kernel(
             mask=mask_n[:, None],
             other=0.0,
         )
-        acc = tl.dot(xt, tl.trans(w))
+        acc = tl.dot(xt, tl.trans(w.to(xt.dtype)))
+        if HAS_SCALE:  # FP8 rows: one scale per output row
+            acc *= tl.load(s_down_ptr + n, mask=mask_n, other=0.0)[None, :]
         tl.atomic_add(
             t_raw_ptr + offs_m[:, None] * LOWRANK + n[None, :],
             acc,
@@ -113,7 +118,9 @@ def _hc_mix_persistent_kernel(
                 mask=mask_gj[:, None] & mask_r[None, :],
                 other=0.0,
             )
-            acc = tl.dot(t, tl.trans(w), acc)
+            acc = tl.dot(t, tl.trans(w.to(t.dtype)), acc)
+        if HAS_SCALE:
+            acc *= tl.load(s_up_ptr + gj_flat, mask=mask_gj, other=0.0)[None, :]
         gate = tl.sigmoid(tl.reshape(acc, (ROWS, HC, BLOCK_J)))
         xg = tl.load(
             x_ptr
@@ -168,8 +175,8 @@ def fused_hc_mix_supported(
     return (
         hyper_input_normed.is_cuda
         and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
-        and w_down.dtype == hyper_input_normed.dtype
-        and w_up.dtype == hyper_input_normed.dtype
+        and w_down.dtype in (hyper_input_normed.dtype, torch.float8_e4m3fn)
+        and w_up.dtype == w_down.dtype
         and hyper_input_normed.shape[0] <= _FUSED_MIX_MAX_ROWS
         and hyper_input_normed.dim() == 2
         and hyper_input_normed.shape[1] % 2048 == 0
@@ -195,10 +202,13 @@ def fused_hc_mix(
     out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
     if rows == 0:
         return out
+    s_down = getattr(w_down, "fp8_row_scale", None)
     _hc_mix_persistent_kernel[(num_ctas,)](
         hyper_input_normed,
         w_down,
         w_up,
+        s_down,
+        getattr(w_up, "fp8_row_scale", None),
         t_raw,
         out,
         _get_counters(device),
@@ -210,10 +220,12 @@ def fused_hc_mix(
         1.0 / hc,
         ROWS=rows_pad,
         HC=hc,
-        BLOCK_N=32,
+        # FP8 rows halve the bytes, so smaller up-projection blocks keep more SMs busy.
+        BLOCK_N=64 if s_down is not None else 32,
         BLOCK_K=256,
-        BLOCK_J=32,
+        BLOCK_J=16 if s_down is not None else 32,
         BLOCK_R=64,
+        HAS_SCALE=s_down is not None,
         num_warps=8,
     )
     return out

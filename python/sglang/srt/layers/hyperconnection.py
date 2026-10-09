@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.layers.quantization.decode_gemv import dequantize_rows
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -267,8 +268,8 @@ class GatedResidual(HyperConnectionBase):
         else:
             mixed_input = self._mix_compute(
                 hyper_input_normed,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                dequantize_rows(self.input_mix_weight_down.weight, self.params_dtype),
+                dequantize_rows(self.input_mix_weight_up.weight, self.params_dtype),
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)

@@ -29,6 +29,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.quantization.decode_gemv import block_fp8_gemv, use_block_fp8_gemv
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import (
     get_exec,
@@ -1210,6 +1211,11 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
 
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
+    if use_block_fp8_gemv(input_2d, weight, block_size):
+        output = block_fp8_gemv(input_2d.contiguous(), weight, weight_scale)
+        if bias is not None:
+            output += bias
+        return output.view(*output_shape)
 
     # Quantize into row-padded buffers so the sgl-kernel wrapper's per-call
     # pad_tensor() on mat_a / scales_a short-circuits (saves 2x fill + 2x cat
