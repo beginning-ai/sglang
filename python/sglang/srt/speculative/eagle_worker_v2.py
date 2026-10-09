@@ -232,21 +232,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.init_token_map()
         self.init_lm_head()
 
-        if get_spec().speculative_use_rejection_sampling:
-            target_vocab_size = self.target_worker.model_config.vocab_size
-            draft_vocab_size = (
-                self.hot_token_id.shape[0]
-                if self.hot_token_id is not None
-                else target_vocab_size
-            )
-            # FIXME: support reduced (hot) draft vocab by scattering draft probs
-            # into the target vocab via the d2t map before the sampling kernel.
-            if draft_vocab_size != target_vocab_size:
-                raise ValueError(
-                    "--speculative-use-rejection-sampling requires the draft and "
-                    f"target to share one vocab, but the draft vocab "
-                    f"({draft_vocab_size}) != target vocab ({target_vocab_size})."
-                )
+        self.target_vocab_size = self.target_worker.model_config.vocab_size
+
+    def _to_target_vocab(self, probs: torch.Tensor) -> torch.Tensor:
+        """Draft probabilities over the FR-Spec hot vocabulary, scattered into
+        the target vocabulary (zero elsewhere) for the rejection-sampling
+        verify. Tokens outside the hot set are never proposed, so q = 0 there
+        is the distribution the draft token was actually drawn from."""
+        if self.hot_token_id is None or probs.shape[-1] == self.target_vocab_size:
+            return probs
+        full = probs.new_zeros((*probs.shape[:-1], self.target_vocab_size))
+        return full.index_copy_(-1, self.hot_token_id, probs)
 
     def init_attention_backends(self):
         with (
@@ -790,7 +786,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         forward_batch.sampling_info.temperatures,
                         forward_batch.sampling_info.top_ks,
                     )
-                    draft_probs_list.append(probs)
+                    draft_probs_list.append(self._to_target_vocab(probs))
                     forward_batch.positions.add_(1)
                 elif self.topk == 1:
                     if _is_cuda or _is_hip:
@@ -1004,7 +1000,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
-            draft_probs=probs if use_rejection_sampling else None,
+            draft_probs=self._to_target_vocab(probs) if use_rejection_sampling else None,
             hidden_states=logits_output.hidden_states,
             bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
@@ -1197,7 +1193,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_hidden_states,
         )
         if get_spec().speculative_use_rejection_sampling:
-            next_draft_input.draft_probs = ret_draft_probs
+            next_draft_input.draft_probs = self._to_target_vocab(ret_draft_probs)
         if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
         next_draft_input.cuda_graph_compatible = not (
