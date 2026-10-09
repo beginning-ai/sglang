@@ -19,13 +19,14 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe import nvfp4_decode_moe
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
     register_fused_func,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import get_bool_env_var, is_flashinfer_available
 from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
@@ -294,6 +295,21 @@ def _run_flashinfer_cutlass(
             quant_scales[4].view(torch.int32),
             quant_scales[5],
         ]
+
+    if (
+        quant_info.quant_type == "fp4"
+        and x_sf is None
+        and x.shape[0] <= nvfp4_decode_moe.MAX_TOKENS
+        and runner_config.is_gated
+        and runner_config.activation == "silu"
+        and quant_info.swiglu_limit is None
+        and runner_config.moe_ep_size == runner_config.moe_tp_size == 1
+        and get_bool_env_var("SGLANG_NVFP4_DECODE_MOE")
+    ):
+        return nvfp4_decode_moe.nvfp4_decode_moe(
+            x, topk_ids, topk_weights, quant_info.w13_weight, quant_info.w2_weight,
+            quant_info.quant_scales, output,
+        )
 
     output = flashinfer_cutlass_fused_moe(
         output=output,
