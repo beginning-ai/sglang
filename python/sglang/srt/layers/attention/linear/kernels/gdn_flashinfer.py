@@ -208,7 +208,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # The SM120 chunked-prefill kernel only accepts float32 initial
         # states; SM100 accepts the state-pool dtype directly.
         self._prefill_needs_fp32_state = sm_major >= 12
-        self.supports_target_verify = sm_major in (9, 10)
+        self.supports_target_verify = sm_major in (9, 10, 12)
         self._aligned_input_buffers: dict[tuple, torch.Tensor] = {}
         self._aligned_parameter_cache: dict[
             tuple, tuple[torch.Tensor, torch.Tensor]
